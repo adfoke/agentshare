@@ -44,15 +44,22 @@ ASH_DEFAULT_TTL=30d \
 
 ## 二、nginx + Cloudflare
 
-需要三个文件：
+需要四个文件（两个 snippet、一个 vhost、一个生成脚本）：
 
 ```bash
+install -d -m 0755 /etc/nginx/snippets /var/www/certbot
 install -m 0644 nginx/agentshare-proxy.conf   /etc/nginx/snippets/agentshare-proxy.conf
+install -m 0644 nginx/acme-challenge.conf     /etc/nginx/snippets/acme-challenge.conf
 install -m 0644 nginx/tempsnap.cc.conf        /etc/nginx/sites-available/<你的域名>.conf   # 记得改成自己的 server_name
 bash nginx/update-cloudflare-ips.sh           # 生成 /etc/nginx/conf.d/cloudflare-realip.conf
 ln -sf /etc/nginx/sites-available/<域名>.conf /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
 ```
+
+⚠️ `acme-challenge.conf` 要 **include 进每一个 server 块**，不只是 80 的那个。
+Let's Encrypt 的 http-01 走明文 HTTP，所以只放 80 今天也够 —— 但任何从 HTTPS 进来的
+挑战（重定向、客户端偏好、CF 的 Always Use HTTPS）都会落到 `location /` 拿到 API 的 404。
+这种失败之所以难查，正因为 80 那条路是通的：看起来证书没问题，直到唯一需要它的那一刻。
 
 ### 为什么 nginx 那份配置里是这几条
 
