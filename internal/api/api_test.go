@@ -298,6 +298,73 @@ func TestRouterMatchesDeclaredEndpoints(t *testing.T) {
 	}
 }
 
+// HEAD is defined as "GET without the body", and callers reach for it
+// constantly: `curl -I`, uptime monitors, link checkers. A 405 there reads as
+// "the service is down" to every one of them, which is how this gap survived
+// until someone happened to use -I.
+func TestHeadMirrorsGet(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, up := e.upload([]byte("head probe"), "head.txt")
+	id := fileOf(t, up)["id"].(string)
+
+	for _, tc := range []struct {
+		path     string
+		needsKey bool
+	}{
+		{"/", false},
+		{"/healthz", false},
+		{"/openapi.json", false},
+		{"/llms.txt", false},
+		{"/v1/whoami", true},
+		{"/v1/files", true},
+		{"/v1/files/" + id, true},
+		{"/v1/files/" + id + "/content", true},
+	} {
+		var opts []reqOpt
+		if !tc.needsKey {
+			opts = append(opts, withoutAuth())
+		}
+		resp := e.do(http.MethodHead, tc.path, nil, opts...)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("HEAD %s = %d, want 200", tc.path, resp.StatusCode)
+		}
+		if body := readBody(t, resp); body != "" {
+			t.Errorf("HEAD %s sent a body: %q", tc.path, body)
+		}
+	}
+
+	// A method name is not a way around authentication.
+	resp := e.do(http.MethodHead, "/v1/files", nil, withoutAuth())
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("HEAD /v1/files without a token = %d, want 401", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Nor is it a way to spend someone else's download budget: a HEAD on a
+	// share link is a metadata check, not a download.
+	created := struct {
+		Share map[string]any `json:"share"`
+	}{}
+	decode(t, e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_id": id, "max_downloads": 1}),
+		withHeader("Content-Type", "application/json")), &created)
+	token := created.Share["id"].(string)
+
+	for i := 0; i < 3; i++ {
+		resp = e.do(http.MethodHead, "/s/"+token, nil, withoutAuth())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("HEAD on a share link = %d, want 200", resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+	// The single credit must survive those, so a real download still works.
+	resp = e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD requests spent the share's download budget: GET = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestUnknownRouteAndMethod(t *testing.T) {
 	e := newTestEnv(t, nil)
 

@@ -22,6 +22,13 @@ import (
 	"github.com/adfoke/agentshare/internal/store"
 )
 
+// routeRegistrar is satisfied by both *gin.Engine and *gin.RouterGroup, which
+// is what lets one helper register a route on the root and on a group alike.
+type routeRegistrar interface {
+	GET(string, ...gin.HandlerFunc) gin.IRoutes
+	HEAD(string, ...gin.HandlerFunc) gin.IRoutes
+}
+
 // Server wires configuration, storage and routing together.
 type Server struct {
 	cfg        *config.Config
@@ -57,6 +64,23 @@ func New(cfg *config.Config, st *store.Store, bl *blob.Store, log *slog.Logger, 
 	}
 	r.Use(s.recoverPanic(), s.withRequestID(), s.accessLog(), s.securityHeaders(), s.cors())
 
+	// get registers a read route under both GET and HEAD. A resource that
+	// answers GET should answer HEAD — the method is defined as "GET without the
+	// body", and callers reach for it constantly: `curl -I`, uptime monitors,
+	// link checkers, anything that wants to know whether a URL is alive without
+	// paying for the payload. Answering 405 there looks to those tools exactly
+	// like the service being down.
+	//
+	// The handler is shared, so the HEAD-specific behaviour already written into
+	// the handlers keeps working: a HEAD on a share link or on file content still
+	// skips the download counter, because they test for GET by method. The body
+	// a handler writes is discarded by net/http for HEAD requests, so nothing
+	// here has to suppress it.
+	get := func(group routeRegistrar, path string, handlers ...gin.HandlerFunc) {
+		group.GET(path, handlers...)
+		group.HEAD(path, handlers...)
+	}
+
 	r.NoRoute(func(c *gin.Context) {
 		fail(c, http.StatusNotFound, codeNotFound, "no such endpoint",
 			"GET "+s.absURL(c, "/")+" lists every endpoint, or read "+s.absURL(c, "/openapi.json"))
@@ -68,22 +92,21 @@ func New(cfg *config.Config, st *store.Store, bl *blob.Store, log *slog.Logger, 
 	})
 
 	// --- open, no credential required -------------------------------------
-	r.GET("/", s.describe)
-	r.GET("/healthz", s.health)
-	r.GET("/openapi.json", s.openapi)
-	r.GET("/llms.txt", s.llms)
+	get(r, "/", s.describe)
+	get(r, "/healthz", s.health)
+	get(r, "/openapi.json", s.openapi)
+	get(r, "/llms.txt", s.llms)
 	r.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	// Capability URLs: possession of the token is the credential.
-	r.GET("/s/:token", s.publicDownload)
-	r.HEAD("/s/:token", s.publicDownload)
-	r.GET("/s/:token/info", s.publicShareInfo)
+	get(r, "/s/:token", s.publicDownload)
+	get(r, "/s/:token/info", s.publicShareInfo)
 
 	// --- authenticated ----------------------------------------------------
 	v1 := r.Group("/v1")
 
-	v1.GET("/whoami", s.authenticate(), s.whoami)
-	v1.GET("/stats", s.authenticate(), s.requireScope(ScopeList), s.stats)
+	get(v1, "/whoami", s.authenticate(), s.whoami)
+	get(v1, "/stats", s.authenticate(), s.requireScope(ScopeList), s.stats)
 
 	// Upload. POST and PUT are both accepted with a raw request body; a
 	// multipart/form-data body is understood as well, taking the first file
@@ -92,25 +115,23 @@ func New(cfg *config.Config, st *store.Store, bl *blob.Store, log *slog.Logger, 
 	v1.PUT("/files", s.authenticate(), s.requireScope(ScopeUpload), s.uploadFile)
 	v1.POST("/text", s.authenticate(), s.requireScope(ScopeUpload), s.uploadText)
 
-	v1.GET("/files", s.authenticate(), s.requireScope(ScopeList), s.listFiles)
-	v1.GET("/files/:id", s.authenticate(), s.requireScope(ScopeDownload), s.fileMeta)
-	v1.GET("/files/:id/content", s.authenticate(), s.requireScope(ScopeDownload), s.fileContent)
-	v1.HEAD("/files/:id/content", s.authenticate(), s.requireScope(ScopeDownload), s.fileContent)
+	get(v1, "/files", s.authenticate(), s.requireScope(ScopeList), s.listFiles)
+	get(v1, "/files/:id", s.authenticate(), s.requireScope(ScopeDownload), s.fileMeta)
+	get(v1, "/files/:id/content", s.authenticate(), s.requireScope(ScopeDownload), s.fileContent)
 	v1.DELETE("/files/:id", s.authenticate(), s.requireScope(ScopeDelete), s.deleteFile)
 
 	// Content-addressed access: no file id needed if you know the digest.
 	v1.PUT("/content/:sha256", s.authenticate(), s.requireScope(ScopeUpload), s.uploadFile)
-	v1.GET("/content/:sha256", s.authenticate(), s.requireScope(ScopeDownload), s.getContent)
-	v1.HEAD("/content/:sha256", s.authenticate(), s.requireScope(ScopeDownload), s.getContent)
-	v1.GET("/content/:sha256/meta", s.authenticate(), s.requireScope(ScopeDownload), s.contentMeta)
+	get(v1, "/content/:sha256", s.authenticate(), s.requireScope(ScopeDownload), s.getContent)
+	get(v1, "/content/:sha256/meta", s.authenticate(), s.requireScope(ScopeDownload), s.contentMeta)
 
 	v1.POST("/shares", s.authenticate(), s.requireScope(ScopeShare), s.createShare)
-	v1.GET("/shares", s.authenticate(), s.requireScope(ScopeShare), s.listShares)
-	v1.GET("/shares/:id", s.authenticate(), s.requireScope(ScopeShare), s.shareMeta)
+	get(v1, "/shares", s.authenticate(), s.requireScope(ScopeShare), s.listShares)
+	get(v1, "/shares/:id", s.authenticate(), s.requireScope(ScopeShare), s.shareMeta)
 	v1.DELETE("/shares/:id", s.authenticate(), s.requireScope(ScopeShare), s.deleteShare)
 
 	v1.POST("/tokens", s.authenticate(), s.requireScope(ScopeAdmin), s.createToken)
-	v1.GET("/tokens", s.authenticate(), s.requireScope(ScopeAdmin), s.listTokens)
+	get(v1, "/tokens", s.authenticate(), s.requireScope(ScopeAdmin), s.listTokens)
 	v1.DELETE("/tokens/:id", s.authenticate(), s.requireScope(ScopeAdmin), s.deleteToken)
 
 	s.router = r
