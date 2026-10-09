@@ -4,7 +4,8 @@
     "title": "agentshare",
     "version": "0.1.0",
     "summary": "Agent-native file exchange over a plain HTTP API.",
-    "description": "Upload, share and download files with no browser involved. Authenticate with a bearer token; hand out capability URLs (/s/<token>) when someone else needs the bytes and has no token of their own. Uploads are content-addressed, so identical bytes are stored once and a retried upload is idempotent."
+    "description": "Upload, share and download files with no browser involved. Authenticate with a bearer token; hand out capability URLs (/s/<token>) when someone else needs the bytes and has no token of their own. Uploads are content-addressed, so identical bytes are stored once and a retried upload is idempotent.",
+    "license": { "name": "MIT", "identifier": "MIT" }
   },
   "servers": [{ "url": "/" }],
   "security": [{ "bearer": [] }, { "apiKey": [] }],
