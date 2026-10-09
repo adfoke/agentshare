@@ -60,6 +60,50 @@ var endpoints = []endpoint{
 
 func versionLine() string { return version.Full() }
 
+// limits describes what this server accepts, and — when a CDN sits in front of
+// the advertised base URL — what that CDN will accept, which is not always the
+// same number.
+//
+// A service reachable both through a CDN and directly is the case that makes
+// this necessary: the direct address can take an upload of any size, while the
+// same POST to the CDN address is rejected by the CDN before it arrives. An
+// agent that only reads GET / would otherwise be told "unlimited", try it, and
+// receive the CDN's own HTML error page instead of this service's JSON.
+func (s *Server) limits(c *gin.Context) gin.H {
+	out := gin.H{
+		"max_upload_bytes":    s.cfg.MaxUpload,
+		"max_upload_note":     formatCap(s.cfg.MaxUpload),
+		"max_ttl_seconds":     int64(s.cfg.MaxTTL.Seconds()),
+		"default_ttl_seconds": int64(s.cfg.DefaultTTL.Seconds()),
+		"list_page_max":       1000,
+	}
+	if s.cfg.ProxyMaxUpload > 0 && s.cfg.BaseURL != "" {
+		proxied := gin.H{
+			"url":              strings.TrimRight(s.cfg.BaseURL, "/"),
+			"max_upload_bytes": s.cfg.ProxyMaxUpload,
+			"note": "uploads to this address above this size are rejected by the proxy in " +
+				"front of it, before they reach this service — the rejection is that " +
+				"proxy's own error, not this API's. Use a direct (non-proxied) address " +
+				"for larger files.",
+		}
+		// Saying "use a direct address" without naming one leaves the reader to
+		// guess a hostname. Name it when it is known.
+		if s.cfg.DirectURL != "" {
+			proxied["direct_url"] = strings.TrimRight(s.cfg.DirectURL, "/")
+			proxied["direct_max_upload_bytes"] = s.cfg.MaxUpload
+		}
+		out["proxied"] = proxied
+	}
+	return out
+}
+
+func formatCap(n int64) string {
+	if n <= 0 {
+		return "0 means unlimited: the only limit is free space on the server"
+	}
+	return "uploads larger than this are rejected with 413"
+}
+
 // describe is the front door. It exists so that an agent which has only been
 // given a URL can discover the whole surface without a human explaining it.
 func (s *Server) describe(c *gin.Context) {
@@ -82,12 +126,7 @@ func (s *Server) describe(c *gin.Context) {
 			"public": []string{"/", "/healthz", "/openapi.json", "/llms.txt", "/s/{token}", "/s/{token}/info"},
 			"scopes": AllScopes,
 		},
-		"limits": gin.H{
-			"max_upload_bytes":    s.cfg.MaxUpload,
-			"max_ttl_seconds":     int64(s.cfg.MaxTTL.Seconds()),
-			"default_ttl_seconds": int64(s.cfg.DefaultTTL.Seconds()),
-			"list_page_max":       1000,
-		},
+		"limits":    s.limits(c),
 		"endpoints": endpoints,
 		"quickstart": []string{
 			`upload:  curl -sS -T ./report.pdf -H "Authorization: Bearer $TOKEN" ` +

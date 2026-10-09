@@ -1053,6 +1053,104 @@ func TestLLMsTxtCarriesTheCallersBaseURL(t *testing.T) {
 	}
 }
 
+// The advertised upload limit has to describe every address the service is
+// reachable on, not just the one this process configured. Getting this wrong is
+// invisible from the server's side: an upload above the proxy's limit is
+// refused by the proxy and never arrives, so the server sees nothing wrong
+// while the caller gets an HTML error page from something they were never told
+// about.
+func TestDescriptorReportsTheProxysUploadCap(t *testing.T) {
+	t.Run("no proxy configured", func(t *testing.T) {
+		e := newTestEnv(t, func(c *config.Config) { c.MaxUpload = 0 })
+		resp := e.do(http.MethodGet, "/", nil, withoutAuth())
+		var doc struct {
+			Limits map[string]any `json:"limits"`
+		}
+		decode(t, resp, &doc)
+
+		if got := doc.Limits["max_upload_bytes"].(float64); got != 0 {
+			t.Fatalf("max_upload_bytes = %v, want 0 (unlimited)", got)
+		}
+		if _, ok := doc.Limits["proxied"]; ok {
+			t.Fatal("no proxy is configured, so there is no proxied cap to advertise")
+		}
+	})
+
+	t.Run("proxy configured", func(t *testing.T) {
+		e := newTestEnv(t, func(c *config.Config) {
+			c.MaxUpload = 0
+			c.ProxyMaxUpload = 100 << 20
+			c.BaseURL = "https://files.example.com"
+		})
+		resp := e.do(http.MethodGet, "/", nil, withoutAuth())
+		var doc struct {
+			Limits map[string]any `json:"limits"`
+		}
+		decode(t, resp, &doc)
+
+		proxied, ok := doc.Limits["proxied"].(map[string]any)
+		if !ok {
+			t.Fatalf("a proxy cap was configured but not advertised: %v", doc.Limits)
+		}
+		if got := proxied["url"]; got != "https://files.example.com" {
+			t.Errorf("proxied.url = %v, want the configured base url", got)
+		}
+		if got := proxied["max_upload_bytes"].(float64); got != float64(100<<20) {
+			t.Errorf("proxied.max_upload_bytes = %v, want %d", got, 100<<20)
+		}
+		if note, _ := proxied["note"].(string); note == "" {
+			t.Error("the proxied cap needs an explanation; a bare number looks like a limit this server enforces")
+		}
+		if _, ok := proxied["direct_url"]; ok {
+			t.Error("no direct address was configured, so none should be named")
+		}
+	})
+
+	t.Run("proxy configured with a direct address", func(t *testing.T) {
+		// "use a direct address for larger files" is only actionable if the
+		// reader is told which address that is.
+		e := newTestEnv(t, func(c *config.Config) {
+			c.MaxUpload = 0
+			c.ProxyMaxUpload = 100 << 20
+			c.BaseURL = "https://files.example.com"
+			c.DirectURL = "https://dl.files.example.com"
+		})
+		resp := e.do(http.MethodGet, "/", nil, withoutAuth())
+		var doc struct {
+			Limits map[string]any `json:"limits"`
+		}
+		decode(t, resp, &doc)
+
+		proxied, ok := doc.Limits["proxied"].(map[string]any)
+		if !ok {
+			t.Fatalf("no proxied cap advertised: %v", doc.Limits)
+		}
+		if got := proxied["direct_url"]; got != "https://dl.files.example.com" {
+			t.Errorf("direct_url = %v, want the configured direct address", got)
+		}
+		if got := proxied["direct_max_upload_bytes"].(float64); got != 0 {
+			t.Errorf("direct_max_upload_bytes = %v, want the server's own cap (0 = unlimited)", got)
+		}
+	})
+
+	t.Run("proxy cap without a base url", func(t *testing.T) {
+		// Nothing names the address the cap applies to, so advertising it would
+		// only confuse: the reader cannot tell which URL it refers to.
+		e := newTestEnv(t, func(c *config.Config) {
+			c.ProxyMaxUpload = 100 << 20
+			c.BaseURL = ""
+		})
+		resp := e.do(http.MethodGet, "/", nil, withoutAuth())
+		var doc struct {
+			Limits map[string]any `json:"limits"`
+		}
+		decode(t, resp, &doc)
+		if _, ok := doc.Limits["proxied"]; ok {
+			t.Fatal("a proxied cap was advertised without a base url to attach it to")
+		}
+	})
+}
+
 func TestConfiguredBaseURLWins(t *testing.T) {
 	e := newTestEnv(t, func(c *config.Config) { c.BaseURL = "https://files.example.com" })
 	_, out := e.upload([]byte("x"), "x.txt")

@@ -145,11 +145,19 @@ HOST=root@host ./deploy/deploy.sh
 
 `install.sh` 是幂等的：重跑只换二进制，**不会动**已有的 token 和数据目录。
 
-**完整部署说明（nginx + Cloudflare 橙云、real_ip、上传上限、运维命令）见
+**完整部署说明（nginx + Cloudflare 橙云、real_ip、直连地址、上传上限、运维命令）见
 [`deploy/README.md`](deploy/README.md)。** 里面记了几个只有真跑才会暴露的坑：
-橙云下单文件上限 100 MiB（超了拿到的是 CF 的 HTML 而不是 API 的 JSON）、
+橙云对**请求体**限 100 MiB（超了拿到的是 CF 的 HTML 而不是 API 的 JSON）、
+**响应体没有同等限制**（300 MiB 大文件经 CF 能完整下回来）、
 `client_max_body_size`/`proxy_request_buffering` 为什么必须改、
 以及 `systemctl is-active` 并不代表服务已经能应答。
+
+### 两条地址：代理的 + 直连的
+
+橙云会限制请求体大小，所以**要传大文件就得另开一条灰云（DNS only）的子域直连源站**。
+那样 443 必须对全网开放，于是「代理域名只有 CF 能访问」这条防线从 ufw 挪进了 nginx
+（判 `$realip_remote_addr`，不是 `$remote_addr` —— realip 会在 access 阶段之前把它改写成客户端）。
+`ASH_PROXY_MAX_UPLOAD` + `ASH_DIRECT_URL` 让 `GET /` 把两条地址和各自的上限都讲清楚。
 
 - `deploy/agentshare.service` —— 单元文件，带一套加固（`DynamicUser`、`ProtectSystem=strict`、
   `CapabilityBoundingSet=` 清空等）。⚠️ 里面 `RestrictAddressFamilies` **必须包含
@@ -174,6 +182,8 @@ HOST=root@host ./deploy/deploy.sh
 | `--base-url` | `AGENTSHARE_BASE_URL` | 空 | 响应里 URL 的前缀；空 = 按请求推导 |
 | `--admin-token` | `AGENTSHARE_ADMIN_TOKEN` | 空 | root token；空 = 读 `data/admin.token`，没有就生成 |
 | `--max-upload` | `AGENTSHARE_MAX_UPLOAD` | `5G` | 单次上传上限，`0` = 不限 |
+| `--proxy-max-upload` | `AGENTSHARE_PROXY_MAX_UPLOAD` | `0` | **前面那层**（CDN）的上限，只写进自述、不在本进程执行 |
+| `--direct-url` | `AGENTSHARE_DIRECT_URL` | 空 | 另一条不经 CDN 的地址，让 `GET /` 能说出大文件该往哪传 |
 | `--max-ttl` | `AGENTSHARE_MAX_TTL` | `0` | 寿命上限，超了**报错**而不是悄悄改短 |
 | `--default-ttl` | `AGENTSHARE_DEFAULT_TTL` | `0` | 没指定寿命时的默认值，`0` = 永久 |
 | `--janitor-interval` | `AGENTSHARE_JANITOR_INTERVAL` | `1m` | 清理频率，`0` = 关掉 |

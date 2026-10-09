@@ -49,6 +49,13 @@ Replies: 201 with the file, or 200 when the same bytes under the same name were
 already stored (the reply says "deduplicated": true). Retrying an upload is
 therefore safe.
 
+Size limits: check `limits` in GET / before sending anything large. A service
+may be reachable on two addresses — one through a CDN, one direct — and a CDN
+caps request bodies. When that applies you will see a `limits.proxied` object
+naming the address and its cap, and an upload above it is refused by the CDN:
+the response is the CDN's own error page, not this API's JSON, so there is no
+`hint` to read. Use the direct address for anything that large.
+
 Small text: POST /v1/text with {"name": "...", "content": "..."}.
 
 ## Share

@@ -127,6 +127,40 @@ func TestEnvIsRead(t *testing.T) {
 	}
 }
 
+func TestProxyMaxUpload(t *testing.T) {
+	// Default is "no proxy in front", which is the safe assumption: advertising
+	// a cap that does not exist would push callers away from an address that
+	// works fine.
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProxyMaxUpload != 0 {
+		t.Fatalf("ProxyMaxUpload defaults to %d, want 0", cfg.ProxyMaxUpload)
+	}
+
+	cfg, err = Load([]string{"--proxy-max-upload", "100M"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProxyMaxUpload != 100<<20 {
+		t.Fatalf("ProxyMaxUpload = %d, want %d", cfg.ProxyMaxUpload, 100<<20)
+	}
+
+	if _, err := Load([]string{"--proxy-max-upload", "plenty"}); err == nil {
+		t.Fatal("a malformed size should be rejected rather than silently ignored")
+	}
+
+	t.Setenv("AGENTSHARE_PROXY_MAX_UPLOAD", "1G")
+	cfg, err = Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ProxyMaxUpload != 1<<30 {
+		t.Fatalf("environment ignored: ProxyMaxUpload = %d", cfg.ProxyMaxUpload)
+	}
+}
+
 func TestDefaultTTLIsClampedToMaxTTL(t *testing.T) {
 	// Otherwise the server would refuse its own default.
 	cfg, err := Load([]string{"--default-ttl", "30d", "--max-ttl", "1h"})

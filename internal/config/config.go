@@ -35,6 +35,27 @@ type Config struct {
 
 	// MaxUpload caps the size of a single upload in bytes. 0 disables the cap.
 	MaxUpload int64
+
+	// ProxyMaxUpload describes a cap imposed by whatever sits in front of
+	// BaseURL — a CDN, typically. It cannot be enforced here, because a request
+	// over that limit never arrives; it exists so the descriptor can avoid
+	// advertising an upload size that BaseURL will actually reject.
+	//
+	// This matters when a service is reachable both through a CDN and directly:
+	// the direct address can take unlimited uploads while the CDN address
+	// cannot, and an agent that only reads GET / has no other way to know.
+	// 0 means "no cap in front" (the default).
+	ProxyMaxUpload int64
+
+	// DirectURL is another address this service is reachable on that does not
+	// go through the proxy — typically an unproxied hostname.
+	//
+	// It changes nothing about how this process behaves; it exists so the
+	// descriptor can answer the question that describing ProxyMaxUpload raises.
+	// Telling a caller "this address is capped, use a direct one" is only
+	// useful if it also says which address that is. Empty means the service
+	// knows of no such address and omits the field entirely.
+	DirectURL string
 	// MaxTTL caps every requested lifetime. 0 disables the cap.
 	MaxTTL time.Duration
 	// DefaultTTL is applied when an upload asks for no explicit lifetime.
@@ -78,13 +99,15 @@ func Load(args []string) (*Config, error) {
 	cfg := &Config{}
 
 	var (
-		maxUploadRaw = env("MAX_UPLOAD", "5G")
-		maxTTLRaw    = env("MAX_TTL", "0")
-		defTTLRaw    = env("DEFAULT_TTL", "0")
-		janitorRaw   = env("JANITOR_INTERVAL", "1m")
-		behindRaw    = env("BEHIND_PROXY", "false")
-		debugRaw     = env("DEBUG", "false")
-		proxiesRaw   = env("TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
+		maxUploadRaw  = env("MAX_UPLOAD", "5G")
+		proxUploadRaw = env("PROXY_MAX_UPLOAD", "0")
+		directURLRaw  = env("DIRECT_URL", "")
+		maxTTLRaw     = env("MAX_TTL", "0")
+		defTTLRaw     = env("DEFAULT_TTL", "0")
+		janitorRaw    = env("JANITOR_INTERVAL", "1m")
+		behindRaw     = env("BEHIND_PROXY", "false")
+		debugRaw      = env("DEBUG", "false")
+		proxiesRaw    = env("TRUSTED_PROXIES", "127.0.0.1/32,::1/128")
 	)
 
 	fs := flag.NewFlagSet("agentshare", flag.ContinueOnError)
@@ -99,6 +122,10 @@ func Load(args []string) (*Config, error) {
 		"root token; empty means load data-dir/admin.token or generate one")
 	fs.StringVar(&maxUploadRaw, "max-upload", maxUploadRaw,
 		"maximum size of one upload, e.g. 512M, 5G, 0 for unlimited")
+	fs.StringVar(&proxUploadRaw, "proxy-max-upload", proxUploadRaw,
+		"upload cap imposed by a proxy/CDN in front of --base-url (advertised, not enforced here)")
+	fs.StringVar(&cfg.DirectURL, "direct-url", directURLRaw,
+		"another address this service is reachable on that bypasses the proxy (advertised only)")
 	fs.StringVar(&maxTTLRaw, "max-ttl", maxTTLRaw,
 		"cap on every requested lifetime, e.g. 720h (0 = no cap)")
 	fs.StringVar(&defTTLRaw, "default-ttl", defTTLRaw,
@@ -140,6 +167,9 @@ func Load(args []string) (*Config, error) {
 	var err error
 	if cfg.MaxUpload, err = ParseSize(maxUploadRaw); err != nil {
 		return nil, fmt.Errorf("--max-upload: %w", err)
+	}
+	if cfg.ProxyMaxUpload, err = ParseSize(proxUploadRaw); err != nil {
+		return nil, fmt.Errorf("--proxy-max-upload: %w", err)
 	}
 	if cfg.MaxTTL, err = ParseDuration(maxTTLRaw); err != nil {
 		return nil, fmt.Errorf("--max-ttl: %w", err)

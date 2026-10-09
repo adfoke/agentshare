@@ -18,6 +18,13 @@ fi
 
 # The Mac this is usually run from routes everything through a proxy; loopback
 # must not go through it or every check fails for the wrong reason.
+# The address to send requests to, and the address whose name is expected to
+# appear in the absolute URLs the service returns. They are usually the same;
+# they differ when a service is reachable on more than one hostname, because it
+# still has one canonical public URL and that is the one it builds links from.
+#   EXPECT_BASE=https://files.example.com ./smoke.sh https://dl.files.example.com
+EXPECT_BASE="${EXPECT_BASE:-}"
+
 export NO_PROXY="${NO_PROXY:-},127.0.0.1,localhost"
 CURL=(curl -sS --noproxy '*' --max-time 20)
 
@@ -52,7 +59,9 @@ code() { # method path [args...] -> prints the HTTP status
   "${CURL[@]}" -o /dev/null -w '%{http_code}' -X "$method" -H "Authorization: Bearer $TOKEN" "$@" "$BASE$path"
 }
 
+[ -n "$EXPECT_BASE" ] || EXPECT_BASE="$BASE"
 echo "agentshare smoke test against $BASE"
+[ "$EXPECT_BASE" != "$BASE" ] && echo "  (expecting URLs on $EXPECT_BASE)"
 
 # --- discovery ------------------------------------------------------------
 body=$("${CURL[@]}" "$BASE/")
@@ -102,7 +111,7 @@ share=$("${CURL[@]}" -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type:
   -d "{\"file_id\":\"$file_id\",\"ttl\":\"30m\",\"max_downloads\":2,\"label\":\"smoke\"}" \
   "$BASE/v1/shares")
 share_token=$(printf '%s' "$share" | jget share.id)
-eq "share link is a capability URL" "$BASE/s/$share_token" "$(printf '%s' "$share" | jget share.url)"
+eq "share link is a capability URL" "$EXPECT_BASE/s/$share_token" "$(printf '%s' "$share" | jget share.url)"
 
 info=$("${CURL[@]}" "$BASE/s/$share_token/info")
 eq "share info needs no credential" "payload.bin" "$(printf '%s' "$info" | jget file.name)"
