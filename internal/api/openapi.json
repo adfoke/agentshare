@@ -1,0 +1,489 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "agentshare",
+    "version": "0.1.0",
+    "summary": "Agent-native file exchange over a plain HTTP API.",
+    "description": "Upload, share and download files with no browser involved. Authenticate with a bearer token; hand out capability URLs (/s/<token>) when someone else needs the bytes and has no token of their own. Uploads are content-addressed, so identical bytes are stored once and a retried upload is idempotent."
+  },
+  "servers": [{ "url": "/" }],
+  "security": [{ "bearer": [] }, { "apiKey": [] }],
+  "tags": [
+    { "name": "system", "description": "Discovery and health, no credential required." },
+    { "name": "files", "description": "Upload, inspect, download and delete files." },
+    { "name": "shares", "description": "Capability links that let a third party download without a token." },
+    { "name": "tokens", "description": "Scoped API credentials (admin only)." }
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Service description",
+        "description": "Every endpoint, the auth schemes, the limits, and copy-pasteable quickstart commands.",
+        "security": [],
+        "responses": { "200": { "description": "Service descriptor", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Liveness and storage check",
+        "security": [],
+        "responses": {
+          "200": { "description": "Healthy", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } },
+          "503": { "description": "Metadata database unreachable" }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": { "tags": ["system"], "summary": "This document", "security": [], "responses": { "200": { "description": "OpenAPI document", "content": { "application/json": { "schema": { "type": "object" } } } } } }
+    },
+    "/llms.txt": {
+      "get": { "tags": ["system"], "summary": "Plain-text guide written for agents", "security": [], "responses": { "200": { "description": "Guide", "content": { "text/plain": { "schema": { "type": "string" } } } } } }
+    },
+
+    "/v1/files": {
+      "post": { "$ref": "#/components/pathItems/UploadFile" },
+      "put": { "$ref": "#/components/pathItems/UploadFile" },
+      "get": {
+        "tags": ["files"],
+        "summary": "List files",
+        "parameters": [
+          { "name": "q", "in": "query", "description": "Substring of the name, or an exact id / sha256.", "schema": { "type": "string" } },
+          { "name": "tag", "in": "query", "schema": { "type": "string" } },
+          { "name": "owner", "in": "query", "description": "Token id that uploaded the file.", "schema": { "type": "string" } },
+          { "name": "since", "in": "query", "description": "Unix seconds, RFC3339, or a window such as 24h.", "schema": { "type": "string" } },
+          { "name": "until", "in": "query", "schema": { "type": "string" } },
+          { "name": "order", "in": "query", "schema": { "type": "string", "enum": ["asc", "desc"], "default": "desc" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } },
+          { "name": "cursor", "in": "query", "description": "Opaque; copy next_cursor from the previous page.", "schema": { "type": "string" } },
+          { "name": "include_expired", "in": "query", "schema": { "type": "boolean", "default": false } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of files",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "files": { "type": "array", "items": { "$ref": "#/components/schemas/File" } },
+                    "count": { "type": "integer" },
+                    "next_cursor": { "type": "string" },
+                    "has_more": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+
+    "/v1/text": {
+      "post": {
+        "tags": ["files"],
+        "summary": "Upload a short UTF-8 string",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {
+                  "name": { "type": "string", "default": "text.txt" },
+                  "content": { "type": "string" },
+                  "tags": { "type": "array", "items": { "type": "string" } },
+                  "ttl_seconds": { "type": "integer" },
+                  "content_type": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/UploadResult" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+
+    "/v1/files/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "example": "f_9k3m2p7q1r8s4t6v0w5x" }],
+      "get": {
+        "tags": ["files"],
+        "summary": "File metadata",
+        "responses": {
+          "200": { "description": "The file", "content": { "application/json": { "schema": { "type": "object", "properties": { "file": { "$ref": "#/components/schemas/File" } } } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "410": { "$ref": "#/components/responses/Gone" }
+        }
+      },
+      "delete": {
+        "tags": ["files"],
+        "summary": "Delete a file and revoke its share links",
+        "responses": {
+          "200": { "description": "Deleted", "content": { "application/json": { "schema": { "type": "object", "properties": { "deleted": { "type": "boolean" }, "file_id": { "type": "string" }, "blob_freed": { "type": "boolean" } } } } } },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+
+    "/v1/files/{id}/content": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+      "get": {
+        "tags": ["files"],
+        "summary": "Download the bytes",
+        "description": "Supports Range, ETag and If-None-Match. Attachment by default; add ?inline=1 to render instead.",
+        "parameters": [
+          { "name": "inline", "in": "query", "schema": { "type": "boolean", "default": false } },
+          { "name": "Range", "in": "header", "schema": { "type": "string" } },
+          { "name": "If-None-Match", "in": "header", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "The file bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+          "206": { "description": "A byte range of the file" },
+          "304": { "description": "Not modified" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "410": { "$ref": "#/components/responses/Gone" }
+        }
+      },
+      "head": {
+        "tags": ["files"],
+        "summary": "Headers for the bytes, no body",
+        "responses": { "200": { "description": "Same headers as GET, empty body" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+
+    "/v1/content/{sha256}": {
+      "parameters": [{ "name": "sha256", "in": "path", "required": true, "description": "Lowercase hex SHA-256 of the raw bytes.", "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }],
+      "put": {
+        "tags": ["files"],
+        "summary": "Upload and verify against a known digest",
+        "description": "The body is checked against the digest in the path; a mismatch is a 400. Safe to retry: the same digest always lands on the same content.",
+        "requestBody": { "required": true, "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+        "responses": { "201": { "$ref": "#/components/responses/UploadResult" }, "200": { "$ref": "#/components/responses/UploadResult" }, "400": { "$ref": "#/components/responses/BadRequest" } }
+      },
+      "get": {
+        "tags": ["files"],
+        "summary": "Download by digest",
+        "responses": { "200": { "description": "The bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } }, "404": { "$ref": "#/components/responses/NotFound" }, "410": { "$ref": "#/components/responses/Gone" } }
+      },
+      "head": { "tags": ["files"], "summary": "Headers for the bytes, no body", "responses": { "200": { "description": "Same headers as GET, empty body" } } }
+    },
+
+    "/v1/content/{sha256}/meta": {
+      "get": {
+        "tags": ["files"],
+        "summary": "Does this digest exist?",
+        "parameters": [{ "name": "sha256", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[0-9a-f]{64}$" } }],
+        "responses": { "200": { "description": "Existence, size and (when known) the file record", "content": { "application/json": { "schema": { "type": "object", "properties": { "exists": { "type": "boolean" }, "sha256": { "type": "string" }, "size": { "type": "integer" }, "file": { "$ref": "#/components/schemas/File" } } } } } } }
+      }
+    },
+
+    "/v1/shares": {
+      "post": {
+        "tags": ["shares"],
+        "summary": "Create a capability link",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["file_id"],
+                "properties": {
+                  "file_id": { "type": "string" },
+                  "label": { "type": "string" },
+                  "ttl": { "type": "string", "example": "7d" },
+                  "ttl_seconds": { "type": "integer" },
+                  "max_downloads": { "type": "integer", "minimum": 1 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "The share link", "content": { "application/json": { "schema": { "type": "object", "properties": { "share": { "$ref": "#/components/schemas/Share" } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "get": {
+        "tags": ["shares"],
+        "summary": "List share links",
+        "parameters": [
+          { "name": "file_id", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "maximum": 1000, "default": 100 } }
+        ],
+        "responses": { "200": { "description": "Share links", "content": { "application/json": { "schema": { "type": "object", "properties": { "shares": { "type": "array", "items": { "$ref": "#/components/schemas/Share" } }, "count": { "type": "integer" } } } } } } }
+      }
+    },
+
+    "/v1/shares/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+      "get": {
+        "tags": ["shares"],
+        "summary": "One share link",
+        "responses": { "200": { "description": "The share link", "content": { "application/json": { "schema": { "type": "object", "properties": { "share": { "$ref": "#/components/schemas/Share" } } } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      },
+      "delete": {
+        "tags": ["shares"],
+        "summary": "Revoke a share link",
+        "responses": { "200": { "description": "Revoked", "content": { "application/json": { "schema": { "type": "object", "properties": { "deleted": { "type": "boolean" }, "share_id": { "type": "string" } } } } } }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+
+    "/v1/tokens": {
+      "post": {
+        "tags": ["tokens"],
+        "summary": "Mint a scoped token",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["scopes"],
+                "properties": {
+                  "name": { "type": "string", "example": "nightly-ci" },
+                  "scopes": { "type": "array", "items": { "type": "string", "enum": ["upload", "download", "list", "delete", "share", "admin"] } },
+                  "ttl": { "type": "string", "example": "30d" },
+                  "ttl_seconds": { "type": "integer" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": { "description": "The token, including its secret exactly once", "content": { "application/json": { "schema": { "type": "object", "properties": { "token": { "$ref": "#/components/schemas/Token" }, "note": { "type": "string" } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "get": {
+        "tags": ["tokens"],
+        "summary": "List tokens (never their secrets)",
+        "responses": { "200": { "description": "Tokens", "content": { "application/json": { "schema": { "type": "object", "properties": { "tokens": { "type": "array", "items": { "$ref": "#/components/schemas/Token" } }, "count": { "type": "integer" } } } } } } }
+      }
+    },
+
+    "/v1/tokens/{id}": {
+      "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+      "delete": {
+        "tags": ["tokens"],
+        "summary": "Revoke a token",
+        "responses": { "200": { "description": "Revoked" }, "400": { "description": "A token cannot revoke itself" }, "404": { "$ref": "#/components/responses/NotFound" } }
+      }
+    },
+
+    "/v1/whoami": {
+      "get": {
+        "tags": ["tokens"],
+        "summary": "What this credential may do",
+        "responses": { "200": { "description": "The caller", "content": { "application/json": { "schema": { "type": "object", "properties": { "identity": { "$ref": "#/components/schemas/Identity" }, "scopes": { "type": "array", "items": { "type": "string" } } } } } } }, "401": { "$ref": "#/components/responses/Unauthorized" } }
+      }
+    },
+
+    "/v1/stats": {
+      "get": {
+        "tags": ["system"],
+        "summary": "Counts and sizes",
+        "responses": { "200": { "description": "Statistics", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+
+    "/s/{token}": {
+      "parameters": [{ "name": "token", "in": "path", "required": true, "description": "The share token. Possession is the credential.", "schema": { "type": "string" } }],
+      "get": {
+        "tags": ["shares"],
+        "summary": "Download through a share link",
+        "security": [],
+        "parameters": [{ "name": "inline", "in": "query", "schema": { "type": "boolean", "default": false } }],
+        "responses": {
+          "200": { "description": "The bytes", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+          "403": { "description": "Download budget exhausted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "410": { "$ref": "#/components/responses/Gone" }
+        }
+      },
+      "head": { "tags": ["shares"], "summary": "Headers for the bytes, no body and no credit spent", "security": [], "responses": { "200": { "description": "Same headers as GET, empty body" } } }
+    },
+
+    "/s/{token}/info": {
+      "get": {
+        "tags": ["shares"],
+        "summary": "What is behind a share link",
+        "description": "Name, size, digest and remaining downloads, without spending a download credit.",
+        "security": [],
+        "parameters": [{ "name": "token", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Share and file summary" }, "404": { "$ref": "#/components/responses/NotFound" }, "410": { "$ref": "#/components/responses/Gone" } }
+      }
+    }
+  },
+
+  "components": {
+    "securitySchemes": {
+      "bearer": { "type": "http", "scheme": "bearer", "description": "Authorization: Bearer ash_..." },
+      "apiKey": { "type": "apiKey", "in": "header", "name": "X-API-Key" }
+    },
+    "pathItems": {
+      "UploadFile": {
+        "tags": ["files"],
+        "summary": "Upload a file",
+        "description": "The request body is the file itself. Metadata travels in headers or query parameters. A multipart/form-data body is also accepted, using its first file part.",
+        "parameters": [
+          { "name": "X-Filename", "in": "header", "schema": { "type": "string" } },
+          { "name": "X-Tag", "in": "header", "description": "Repeatable; comma separated is fine too.", "schema": { "type": "string" } },
+          { "name": "X-Ttl", "in": "header", "description": "30m, 24h, 7d, 2w, seconds, or 0/never.", "schema": { "type": "string" } },
+          { "name": "X-Meta", "in": "header", "description": "A JSON object stored verbatim with the file.", "schema": { "type": "string" } },
+          { "name": "X-Sha256", "in": "header", "description": "Assert the digest; a mismatch is a 400.", "schema": { "type": "string" } },
+          { "name": "X-Content-Type", "in": "header", "schema": { "type": "string" } },
+          { "name": "name", "in": "query", "schema": { "type": "string" } },
+          { "name": "tag", "in": "query", "schema": { "type": "string" } },
+          { "name": "ttl", "in": "query", "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": { "schema": { "type": "string", "format": "binary" } },
+            "multipart/form-data": { "schema": { "type": "object", "properties": { "file": { "type": "string", "format": "binary" } } } }
+          }
+        },
+        "responses": {
+          "201": { "$ref": "#/components/responses/UploadResult" },
+          "200": { "$ref": "#/components/responses/UploadResult" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "413": { "$ref": "#/components/responses/TooLarge" }
+        }
+      }
+    },
+    "schemas": {
+      "File": {
+        "type": "object",
+        "required": ["id", "name", "size", "sha256", "created_at", "urls"],
+        "properties": {
+          "id": { "type": "string", "example": "f_9k3m2p7q1r8s4t6v0w5x" },
+          "name": { "type": "string" },
+          "size": { "type": "integer", "description": "Bytes." },
+          "sha256": { "type": "string", "description": "Lowercase hex digest of the raw bytes." },
+          "content_type": { "type": "string" },
+          "tags": { "type": "array", "items": { "type": "string" } },
+          "meta": { "type": "object", "description": "Free-form JSON supplied at upload time." },
+          "owner": { "type": "string", "description": "Token id that uploaded the file." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "downloads": { "type": "integer" },
+          "urls": {
+            "type": "object",
+            "properties": {
+              "self": { "type": "string" },
+              "content": { "type": "string" },
+              "download": { "type": "string" },
+              "by_hash": { "type": "string" },
+              "public": { "type": "string", "description": "Present when the file was reached through a share link." }
+            }
+          }
+        }
+      },
+      "Share": {
+        "type": "object",
+        "required": ["id", "url", "file_id", "created_at"],
+        "properties": {
+          "id": { "type": "string", "description": "The capability token appearing in the URL." },
+          "url": { "type": "string", "description": "The complete share URL." },
+          "file_id": { "type": "string" },
+          "label": { "type": "string" },
+          "owner": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "max_downloads": { "type": ["integer", "null"] },
+          "downloads": { "type": "integer" },
+          "file": { "$ref": "#/components/schemas/File" }
+        }
+      },
+      "Token": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "scopes": { "type": "array", "items": { "type": "string" } },
+          "created_at": { "type": "string", "format": "date-time" },
+          "expires_at": { "type": ["string", "null"], "format": "date-time" },
+          "last_used": { "type": ["string", "null"], "format": "date-time" },
+          "secret": { "type": "string", "description": "Returned only by the call that creates the token." }
+        }
+      },
+      "Identity": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["root", "token"] },
+          "scopes": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "Health": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "enum": ["ok", "degraded"] },
+          "version": { "type": "string" },
+          "uptime_seconds": { "type": "integer" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": ["bad_request", "unauthorized", "forbidden", "not_found", "conflict", "gone", "payload_too_large", "unsupported_media_type", "checksum_mismatch", "rate_limited", "internal", "storage_unavailable"]
+              },
+              "message": { "type": "string" },
+              "hint": { "type": "string", "description": "Usually names the exact next call to make." }
+            }
+          },
+          "request_id": { "type": "string" }
+        }
+      }
+    },
+    "responses": {
+      "UploadResult": {
+        "description": "The stored file. 200 instead of 201 means identical bytes under the same name were already present.",
+        "headers": {
+          "Location": { "schema": { "type": "string" }, "description": "URL of the file resource." },
+          "X-File-Id": { "schema": { "type": "string" } },
+          "X-Checksum-Sha256": { "schema": { "type": "string" } }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "file": { "$ref": "#/components/schemas/File" },
+                "deduplicated": { "type": "boolean" },
+                "blob_existed": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      },
+      "BadRequest": { "description": "The request is malformed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Unauthorized": { "description": "Missing, invalid or expired credential", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Forbidden": { "description": "The credential lacks the required scope", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "NotFound": { "description": "No such resource", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "Gone": { "description": "The resource existed and has expired or been deleted", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+      "TooLarge": { "description": "Larger than the server's limit", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+    }
+  }
+}

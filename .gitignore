@@ -1,0 +1,12 @@
+.alma-snapshots
+
+# build output
+/bin/
+
+# runtime state: metadata, blobs and the generated root token
+/data/
+*.db
+*.db-shm
+*.db-wal
+admin.token
+agentshare.env

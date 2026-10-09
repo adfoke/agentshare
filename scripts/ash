@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# ash — a thin shell wrapper over the agentshare API.
+#
+# It is sugar, not a second implementation: every command below is one curl
+# call. Use it interactively or from a script; if you need something it does not
+# cover, the API is the interface.
+#
+#   export ASH_BASE=https://files.example.com
+#   export ASH_TOKEN=ash_...
+#
+#   ash put ./report.pdf --ttl 7d
+#   ash share f_abc123 --ttl 1d --max 3
+#   ash get https://files.example.com/s/<token>
+#   ash ls --tag build
+set -euo pipefail
+
+BASE="${ASH_BASE:-http://127.0.0.1:8080}"
+TOKEN="${ASH_TOKEN:-}"
+# Loopback must not go through a proxy; everything else may.
+export NO_PROXY="${NO_PROXY:-},127.0.0.1,localhost"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+have curl || { echo "ash needs curl" >&2; exit 2; }
+have python3 || { echo "ash needs python3" >&2; exit 2; }
+
+die() { echo "ash: $*" >&2; exit 1; }
+
+# ${auth[@]+...} rather than a plain "${auth[@]}": macOS ships bash 3.2, where
+# expanding an empty array under `set -u` is an unbound-variable error. Sharing
+# a file needs no token at all, so that path would fail every time.
+auth=()
+if [ -n "$TOKEN" ]; then auth=(-H "Authorization: Bearer $TOKEN"); fi
+
+api() { # method path [curl args...]
+  local method="$1" path="$2"
+  shift 2
+  curl -sS --noproxy '*' -X "$method" ${auth[@]+"${auth[@]}"} "$@" "$BASE$path"
+}
+
+# Pull one field out of a JSON reply without depending on jq.
+field() {
+  python3 -c 'import json,sys
+d = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    d = d[int(k)] if isinstance(d, list) else d.get(k)
+    if d is None: break
+if isinstance(d, bool): print("true" if d else "false")
+elif d is None: print("")
+else: print(d)' "$1"
+}
+
+usage() {
+  cat <<'EOF'
+ash — talk to an agentshare instance
+
+  ash put <file|-> [--name N] [--ttl 7d] [--tag t]... [--meta '{"k":1}']
+  ash text <name> [--ttl-secs n]        read the body from stdin
+
+put and text print one tab-separated record: <id> <sha256> <url>
+  ash get <id|url|sha256> [-o out]      default: stdout
+  ash ls [--tag t] [--q text] [--limit n]
+  ash info <id>
+  ash rm <id>
+  ash share <id> [--ttl 7d] [--max n] [--label L]
+  ash shares [file_id]
+  ash unshare <share-id>
+  ash whoami
+
+  ASH_BASE   base URL   (default http://127.0.0.1:8080)
+  ASH_TOKEN  bearer token
+EOF
+}
+
+cmd="${1:-}"
+[ -n "$cmd" ] || { usage; exit 2; }
+shift || true
+
+case "$cmd" in
+  put)
+    src="${1:-}"; shift || true
+    [ -n "$src" ] || die "put needs a file (use - for stdin)"
+    hdr=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) hdr+=(-H "X-Filename: $2"); shift 2 ;;
+        --ttl)  hdr+=(-H "X-Ttl: $2"); shift 2 ;;
+        --tag)  hdr+=(-H "X-Tag: $2"); shift 2 ;;
+        --meta) hdr+=(-H "X-Meta: $2"); shift 2 ;;
+        *) die "unknown option $1" ;;
+      esac
+    done
+    # -T keeps the body raw: no multipart, no wrapper, exactly what the API
+    # was designed around.
+    reply=$(api PUT /v1/files -T "$src" ${hdr[@]+"${hdr[@]}"})
+    id=$(printf '%s' "$reply" | field file.id) || die "unexpected reply: $reply"
+    [ -n "$id" ] || die "$reply"
+    # One record per line, tab separated, so `cut -f1` and `awk '{print $1}'`
+    # both do the obvious thing.
+    printf '%s\t%s\t%s\n' "$id" \
+      "$(printf '%s' "$reply" | field file.sha256)" \
+      "$(printf '%s' "$reply" | field file.urls.self)"
+    ;;
+
+  text)
+    name="${1:-text.txt}"; shift || true
+    ttl=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --ttl-secs) ttl="$2"; shift 2 ;; *) die "unknown option $1" ;; esac
+    done
+    # The body comes from stdin, so the JSON wrapper is built by hand and the
+    # content is never interpreted as a command.
+    payload=$(python3 -c 'import json,sys
+d = {"name": sys.argv[1], "content": sys.stdin.read()}
+if sys.argv[2]:
+    d["ttl_seconds"] = int(sys.argv[2])
+print(json.dumps(d))' "$name" "$ttl")
+    reply=$(api POST /v1/text -H 'Content-Type: application/json' -d "$payload")
+    printf '%s\t%s\t%s\n' "$(printf '%s' "$reply" | field file.id)" \
+      "$(printf '%s' "$reply" | field file.sha256)" \
+      "$(printf '%s' "$reply" | field file.urls.self)"
+    ;;
+
+  get)
+    ref="${1:-}"; shift || true
+    out="-"
+    while [ $# -gt 0 ]; do
+      case "$1" in -o) out="$2"; shift 2 ;; *) die "unknown option $1" ;; esac
+    done
+    [ -n "$ref" ] || die "get needs an id, a share url, or a digest"
+    case "$ref" in
+      http://* | https://*) url="$ref" ;;
+      # A bare digest goes to the content-addressed route.
+      *) if printf '%s' "$ref" | grep -qE '^[0-9a-f]{64}$'; then
+           url="$BASE/v1/content/$ref"
+         else
+           url="$BASE/v1/files/$ref/content"
+         fi ;;
+    esac
+    if [ "$out" = "-" ]; then
+      curl -sS --noproxy '*' ${auth[@]+"${auth[@]}"} "$url"
+    else
+      curl -sS --noproxy '*' ${auth[@]+"${auth[@]}"} -o "$out" "$url" && echo "$out"
+    fi
+    ;;
+
+  ls)
+    qs=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --tag) qs="$qs&tag=$(printf '%s' "$2" | sed 's/ /%20/g')"; shift 2 ;;
+        --q)   qs="$qs&q=$(printf '%s' "$2" | sed 's/ /%20/g')"; shift 2 ;;
+        --limit) qs="$qs&limit=$2"; shift 2 ;;
+        *) die "unknown option $1" ;;
+      esac
+    done
+    api GET "/v1/files?limit=100${qs}" | python3 -c 'import json,sys
+for f in json.load(sys.stdin)["files"]:
+    print("%s\t%9d\t%s\t%s" % (f["id"], f["size"], f["created_at"], f["name"]))'
+    ;;
+
+  info)
+    api GET "/v1/files/${1:?info needs an id}" | python3 -m json.tool
+    ;;
+
+  rm)
+    api DELETE "/v1/files/${1:?rm needs an id}"
+    echo
+    ;;
+
+  share)
+    id="${1:?share needs a file id}"; shift || true
+    payload=$(python3 -c 'import json,sys
+d={"file_id":sys.argv[1]}
+a=sys.argv[2:]
+for i in range(0,len(a),2):
+    if a[i]=="--ttl": d["ttl"]=a[i+1]
+    elif a[i]=="--max": d["max_downloads"]=int(a[i+1])
+    elif a[i]=="--label": d["label"]=a[i+1]
+print(json.dumps(d))' "$id" "$@")
+    reply=$(api POST /v1/shares -H 'Content-Type: application/json' -d "$payload")
+    printf '%s\n' "$(printf '%s' "$reply" | field share.url)"
+    ;;
+
+  shares)
+    api GET "/v1/shares${1:+?file_id=$1}" | python3 -c 'import json,sys
+for s in json.load(sys.stdin)["shares"]:
+    left = "-" if s["max_downloads"] is None else s["max_downloads"] - s["downloads"]
+    print("%s\t%s\t%s\tleft=%s\t%s" % (s["id"], s["created_at"], s["file_id"], left, s["url"]))'
+    ;;
+
+  unshare)
+    api DELETE "/v1/shares/${1:?unshare needs a share id}"
+    echo
+    ;;
+
+  whoami)
+    api GET /v1/whoami | python3 -m json.tool
+    ;;
+
+  -h | --help | help)
+    usage
+    ;;
+
+  *)
+    die "unknown command $cmd (try: ash help)"
+    ;;
+esac

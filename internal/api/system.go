@@ -1,0 +1,141 @@
+package api
+
+import (
+	"context"
+	_ "embed"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/adfoke/agentshare/internal/version"
+)
+
+//go:embed openapi.json
+var openapiJSON []byte
+
+//go:embed llms.txt
+var llmsText string
+
+// endpoint is one row of the self-description. It is the single source of truth
+// for GET / and is cross-checked against openapi.json by the test suite, so the
+// two can never drift apart in silence.
+type endpoint struct {
+	Method  string `json:"method"`
+	Path    string `json:"path"`
+	Scope   string `json:"scope,omitempty"`
+	Summary string `json:"summary"`
+}
+
+var endpoints = []endpoint{
+	{"GET", "/", "", "this document"},
+	{"GET", "/healthz", "", "liveness and storage check"},
+	{"GET", "/openapi.json", "", "OpenAPI 3.1 description of every endpoint"},
+	{"GET", "/llms.txt", "", "plain-text guide written for agents"},
+
+	{"POST", "/v1/files", ScopeUpload, "upload bytes; body is the file, metadata in headers"},
+	{"PUT", "/v1/files", ScopeUpload, "same as POST"},
+	{"POST", "/v1/text", ScopeUpload, "upload a short UTF-8 string as JSON"},
+	{"PUT", "/v1/content/{sha256}", ScopeUpload, "upload and verify against a known digest"},
+	{"GET", "/v1/content/{sha256}", ScopeDownload, "download bytes by digest"},
+	{"GET", "/v1/content/{sha256}/meta", ScopeDownload, "does this digest exist, and how big"},
+	{"GET", "/v1/files", ScopeList, "list files (q, tag, since, until, order, cursor)"},
+	{"GET", "/v1/files/{id}", ScopeDownload, "metadata for one file"},
+	{"GET", "/v1/files/{id}/content", ScopeDownload, "download bytes; supports Range and ETag"},
+	{"DELETE", "/v1/files/{id}", ScopeDelete, "delete a file and revoke its share links"},
+	{"POST", "/v1/shares", ScopeShare, "create a capability link for a file"},
+	{"GET", "/v1/shares", ScopeShare, "list share links"},
+	{"GET", "/v1/shares/{id}", ScopeShare, "metadata for one share link"},
+	{"DELETE", "/v1/shares/{id}", ScopeShare, "revoke a share link"},
+	{"POST", "/v1/tokens", ScopeAdmin, "mint a scoped API token"},
+	{"GET", "/v1/tokens", ScopeAdmin, "list API tokens"},
+	{"DELETE", "/v1/tokens/{id}", ScopeAdmin, "revoke an API token"},
+	{"GET", "/v1/whoami", "", "what this credential may do"},
+	{"GET", "/v1/stats", ScopeList, "counts and sizes"},
+
+	{"GET", "/s/{token}", "", "download through a share link (no credential needed)"},
+	{"GET", "/s/{token}/info", "", "what is behind a share link, without spending a download"},
+}
+
+func versionLine() string { return version.Full() }
+
+// describe is the front door. It exists so that an agent which has only been
+// given a URL can discover the whole surface without a human explaining it.
+func (s *Server) describe(c *gin.Context) {
+	base := s.baseURL(c)
+	c.JSON(http.StatusOK, gin.H{
+		"service":     "agentshare",
+		"version":     version.Full(),
+		"api_version": version.APIVersion,
+		"description": "Agent-native file exchange over a plain HTTP API. " +
+			"Upload, share, download. No browser required, and none provided.",
+		"docs": gin.H{
+			"openapi": base + "/openapi.json",
+			"guide":   base + "/llms.txt",
+			"health":  base + "/healthz",
+		},
+		"auth": gin.H{
+			"scheme": "bearer",
+			"how":    "Authorization: Bearer <token>",
+			"also":   "X-API-Key: <token> is accepted as well",
+			"public": []string{"/", "/healthz", "/openapi.json", "/llms.txt", "/s/{token}", "/s/{token}/info"},
+			"scopes": AllScopes,
+		},
+		"limits": gin.H{
+			"max_upload_bytes":    s.cfg.MaxUpload,
+			"max_ttl_seconds":     int64(s.cfg.MaxTTL.Seconds()),
+			"default_ttl_seconds": int64(s.cfg.DefaultTTL.Seconds()),
+			"list_page_max":       1000,
+		},
+		"endpoints": endpoints,
+		"quickstart": []string{
+			`upload:  curl -sS -T ./report.pdf -H "Authorization: Bearer $TOKEN" ` +
+				`-H "X-Filename: report.pdf" -H "X-Ttl: 7d" ` + base + `/v1/files`,
+			`share:   curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" ` +
+				`-d '{"file_id":"f_...","ttl":"7d","max_downloads":3}' ` + base + `/v1/shares`,
+			`fetch:   curl -sS -O -J ` + base + `/s/<share-token>`,
+			`list:    curl -sS -H "Authorization: Bearer $TOKEN" "` + base + `/v1/files?limit=20&order=desc"`,
+			`text:    curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" ` +
+				`-d '{"name":"build.log","content":"all green"}' ` + base + `/v1/text`,
+			`check:   curl -sS -H "Authorization: Bearer $TOKEN" ` + base + `/v1/whoami`,
+		},
+		"conventions": []string{
+			"errors are always {\"error\":{\"code\",\"message\",\"hint\"}} with a stable code",
+			"every response that names a resource also carries its absolute url",
+			"uploads are identified by content: identical bytes are stored once",
+			"a retried upload of the same bytes and name returns the original file, not a copy",
+			"downloads support Range, ETag and If-None-Match",
+		},
+	})
+}
+
+func (s *Server) health(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	body := gin.H{
+		"status":         "ok",
+		"version":        version.Full(),
+		"uptime_seconds": int64(s.now().Sub(s.started).Seconds()),
+	}
+	if err := s.store.DB().PingContext(ctx); err != nil {
+		s.log.Error("health check failed", "err", err.Error())
+		body["status"] = "degraded"
+		body["error"] = "metadata database unreachable"
+		c.JSON(http.StatusServiceUnavailable, body)
+		return
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+func (s *Server) openapi(c *gin.Context) {
+	c.Data(http.StatusOK, "application/json; charset=utf-8", openapiJSON)
+}
+
+// llms.txt is served with the caller's own base URL substituted in, so the
+// commands in it are copy-pasteable rather than illustrative.
+func (s *Server) llms(c *gin.Context) {
+	body := strings.ReplaceAll(llmsText, "{{BASE}}", s.baseURL(c))
+	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(body))
+}

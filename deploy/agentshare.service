@@ -1,0 +1,71 @@
+[Unit]
+Description=agentshare — agent-native file exchange API
+Documentation=https://github.com/adfoke/agentshare
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agentshare
+
+# StateDirectory gives the service /var/lib/agentshare and makes systemd keep
+# the ownership right across upgrades. DynamicUser means no user has to be
+# created, and the process has no identity worth stealing between runs.
+DynamicUser=yes
+StateDirectory=agentshare
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/agentshare
+
+# The listening address, data directory and root token belong in the
+# environment file, which is not world readable. See deploy/install.sh.
+Environment=AGENTSHARE_LISTEN=127.0.0.1:8080
+Environment=AGENTSHARE_DATA_DIR=/var/lib/agentshare
+# Set base-url when a reverse proxy terminates TLS in front of agentshare, so
+# the URLs in responses point at the public name rather than the local socket.
+#Environment=AGENTSHARE_BASE_URL=https://files.example.com
+#Environment=AGENTSHARE_BEHIND_PROXY=true
+EnvironmentFile=-/etc/agentshare.env
+
+Restart=on-failure
+RestartSec=2s
+# Transfers can be long; give them time to finish on shutdown.
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# --- hardening ------------------------------------------------------------
+# This is a network service that reads and writes one directory. Everything
+# else can be taken away from it. Each line below was chosen because agentshare
+# does not need the capability it removes; if the service ever grows a feature
+# that does, remove the line rather than weakening it silently.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+# AF_NETLINK is not optional and is easy to miss: Go resolves interfaces and
+# addresses through netlink on Linux. Dropping it makes net.Interfaces() fail,
+# which shows up as "this host has no IPv6" rather than as a permission error,
+# so the service looks healthy while quietly doing the wrong thing.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# No capabilities at all: the default port is 8080, so binding needs none.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

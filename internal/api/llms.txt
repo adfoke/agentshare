@@ -1,0 +1,94 @@
+# agentshare
+
+Agent-native file exchange over a plain HTTP API. One binary, one data
+directory, no browser anywhere in the picture.
+
+Base URL: {{BASE}}
+Machine-readable spec: {{BASE}}/openapi.json
+
+## Credentials
+
+Every /v1 endpoint requires a token:
+
+    Authorization: Bearer ash_...
+    # X-API-Key: ash_... is accepted too
+
+Public, no credential needed: `/`, `/healthz`, `/openapi.json`, `/llms.txt`,
+and any `/s/<share-token>` link you were given.
+
+Not sure what your token can do?
+
+    curl -sS -H "Authorization: Bearer $TOKEN" {{BASE}}/v1/whoami
+
+Scopes: upload, download, list, delete, share, admin.
+
+## Upload
+
+The request body IS the file. No multipart, no base64, no wrapper object.
+
+    curl -sS -T ./report.pdf \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "X-Filename: report.pdf" \
+      -H "X-Ttl: 7d" \
+      {{BASE}}/v1/files
+
+    # from stdin
+    tar czf - ./logs | curl -sS -T - -H "Authorization: Bearer $TOKEN" \
+      -H "X-Filename: logs.tar.gz" {{BASE}}/v1/files
+
+Metadata may go in headers or in the query string; both work:
+
+    X-Filename  / ?name=     stored name (default file.bin)
+    X-Tag       / ?tag=      repeatable, free-form labels
+    X-Ttl       / ?ttl=      30m, 24h, 7d, 2w, or seconds; 0/never = keep
+    X-Meta      / ?meta=     a JSON object of your own, stored verbatim
+    X-Sha256                 assert the digest; a mismatch is a 400
+    X-Content-Type           overrides detection
+
+Replies: 201 with the file, or 200 when the same bytes under the same name were
+already stored (the reply says "deduplicated": true). Retrying an upload is
+therefore safe.
+
+Small text: POST /v1/text with {"name": "...", "content": "..."}.
+
+## Share
+
+A share link is a capability URL: whoever holds it can download, no token of
+their own required.
+
+    curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d '{"file_id":"f_...","ttl":"7d","max_downloads":3,"label":"for bob"}' \
+      {{BASE}}/v1/shares
+
+The reply contains `share.url`. Revoke with DELETE /v1/shares/{id}.
+
+`GET /s/<token>/info` describes the link without spending a download credit.
+
+## Download
+
+    curl -sS -O -J {{BASE}}/s/<share-token>
+    curl -sS -H "Authorization: Bearer $TOKEN" -O -J {{BASE}}/v1/files/<id>/content
+    curl -sS -H "Authorization: Bearer $TOKEN" -o out.bin {{BASE}}/v1/content/<sha256>
+
+Range requests, ETag and If-None-Match all work. Add `?inline=1` if you want the
+bytes to render instead of download.
+
+## Find
+
+    curl -sS -H "Authorization: Bearer $TOKEN" \
+      "{{BASE}}/v1/files?limit=50&order=desc&tag=build"
+    # q= substring of the name, or an exact id / sha256
+    # since= / until=  unix seconds, RFC3339, or a window like 24h
+    # next_cursor= from the previous page; treat it as opaque
+
+## Errors
+
+    {"error": {"code": "not_found", "message": "...", "hint": "..."}}
+
+Codes: bad_request 400, unauthorized 401, forbidden 403, not_found 404,
+gone 410 (expired or deleted), payload_too_large 413, checksum_mismatch 400,
+internal 500. Read `hint`: it usually names the exact next call to make.
+
+Retry 5xx once. Do not retry 4xx; the request itself is the problem. Every
+response carries X-Request-Id — quote it when asking a human for help.

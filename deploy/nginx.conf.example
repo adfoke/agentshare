@@ -1,0 +1,59 @@
+# Terminate TLS in front of agentshare.
+#
+# server_name files.example.com;
+# Then start agentshare with:
+#   AGENTSHARE_BASE_URL=https://files.example.com
+#   AGENTSHARE_BEHIND_PROXY=true
+# so the URLs it hands back are the public ones rather than 127.0.0.1:8080.
+
+upstream agentshare {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name files.example.com;
+
+    # Nothing here speaks plaintext; the API is not browsable anyway.
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name files.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/files.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
+
+    # A file service uploads real files. The 1 MiB default would reject almost
+    # all of them before the request even reaches agentshare.
+    client_max_body_size 0;
+
+    # Stream the body straight through instead of spooling it to nginx's disk
+    # first: it halves the write amplification on a large upload, and it means
+    # agentshare sees a partial upload fail immediately rather than after the
+    # client has already sent everything.
+    proxy_request_buffering off;
+
+    # Uploads and downloads are allowed to be slow and large.
+    proxy_read_timeout    1h;
+    proxy_send_timeout    1h;
+    client_body_timeout   1h;
+
+    # X-Forwarded-Proto and -Host are what agentshare reads when
+    # --behind-proxy is on.
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_http_version 1.1;
+
+    location / {
+        proxy_pass http://agentshare;
+    }
+}
