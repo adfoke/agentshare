@@ -145,6 +145,12 @@ HOST=root@host ./deploy/deploy.sh
 
 `install.sh` 是幂等的：重跑只换二进制，**不会动**已有的 token 和数据目录。
 
+**完整部署说明（nginx + Cloudflare 橙云、real_ip、上传上限、运维命令）见
+[`deploy/README.md`](deploy/README.md)。** 里面记了几个只有真跑才会暴露的坑：
+橙云下单文件上限 100 MiB（超了拿到的是 CF 的 HTML 而不是 API 的 JSON）、
+`client_max_body_size`/`proxy_request_buffering` 为什么必须改、
+以及 `systemctl is-active` 并不代表服务已经能应答。
+
 - `deploy/agentshare.service` —— 单元文件，带一套加固（`DynamicUser`、`ProtectSystem=strict`、
   `CapabilityBoundingSet=` 清空等）。⚠️ 里面 `RestrictAddressFamilies` **必须包含
   `AF_NETLINK`**：Go 在 Linux 上是通过 netlink 枚举网卡的，少了它 `net.Interfaces()` 会报错，
