@@ -18,6 +18,21 @@ UNIT_SRC="$HERE/agentshare.service"
 UNIT_DST="/etc/systemd/system/agentshare.service"
 STATE_DIR="/var/lib/agentshare"
 
+# Deployment knobs, read from the environment so that a particular host's setup
+# lives in the command that installed it rather than in a hand-edited file on
+# the server. They are only consulted when the config file is first written.
+#
+#   ASH_BASE_URL=https://files.example.com \
+#   ASH_BEHIND_PROXY=true \
+#   ASH_MAX_UPLOAD=100M \
+#   ASH_DEFAULT_TTL=30d \
+#     bash install.sh
+: "${ASH_BASE_URL:=}"
+: "${ASH_BEHIND_PROXY:=false}"
+: "${ASH_MAX_UPLOAD:=}"
+: "${ASH_DEFAULT_TTL:=}"
+: "${ASH_TRUSTED_PROXIES:=127.0.0.1/32,::1/128}"
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "run as root" >&2
   exit 1
@@ -36,18 +51,27 @@ if [ -f "$ENV_FILE" ] && grep -q '^AGENTSHARE_ADMIN_TOKEN=' "$ENV_FILE"; then
 else
   TOKEN="ash_$(head -c 32 /dev/urandom | base64 | tr -dc 'a-z0-9' | head -c 40)"
   umask 077
-  cat > "$ENV_FILE" <<EOF
+  # Only the knobs that were actually supplied are written, so an unset one
+  # keeps agentshare's own default instead of being pinned to an empty value.
+  {
+    cat <<EOF
 # agentshare configuration. Keep this file out of version control and out of
 # backups that other people can read: AGENTSHARE_ADMIN_TOKEN is the root
 # credential.
 AGENTSHARE_LISTEN=127.0.0.1:8080
 AGENTSHARE_DATA_DIR=$STATE_DIR
 AGENTSHARE_ADMIN_TOKEN=$TOKEN
-# Set these when a reverse proxy terminates TLS in front of agentshare:
-#AGENTSHARE_BASE_URL=https://files.example.com
-#AGENTSHARE_BEHIND_PROXY=true
-#AGENTSHARE_DEFAULT_TTL=30d
+AGENTSHARE_TRUSTED_PROXIES=$ASH_TRUSTED_PROXIES
 EOF
+    # Written as explicit ifs rather than `[ -n "$X" ] && echo ...`: the latter
+    # reads as if it can abort the script under `set -e` when the value is
+    # empty. It does not (bash exempts everything but the last command of an
+    # AND-OR list) but that is a subtlety nobody should have to re-derive.
+    if [ -n "$ASH_BASE_URL" ]; then echo "AGENTSHARE_BASE_URL=$ASH_BASE_URL"; fi
+    if [ -n "$ASH_MAX_UPLOAD" ]; then echo "AGENTSHARE_MAX_UPLOAD=$ASH_MAX_UPLOAD"; fi
+    if [ -n "$ASH_DEFAULT_TTL" ]; then echo "AGENTSHARE_DEFAULT_TTL=$ASH_DEFAULT_TTL"; fi
+    if [ "$ASH_BEHIND_PROXY" = "true" ]; then echo "AGENTSHARE_BEHIND_PROXY=true"; fi
+  } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
   echo
   echo "  root token written to $ENV_FILE (mode 600):"
@@ -59,35 +83,44 @@ fi
 # --- the service ----------------------------------------------------------
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 install -m 0644 "$UNIT_SRC" "$UNIT_DST"
-install -d -m 0750 "$STATE_DIR"
+
+# The data directory is deliberately NOT created here. The unit uses
+# DynamicUser= together with StateDirectory=, so systemd creates and owns it.
+# Pre-creating it makes systemd find a pre-existing "public" directory and
+# migrate it to /var/lib/private on first start, which works but moves the data
+# and logs a scary-looking notice about it.
 
 systemctl daemon-reload
 systemctl enable --now agentshare.service >/dev/null
 
-# enable --now returns as soon as the unit is queued, so ask the service
-# directly rather than assuming it came up.
-for _ in $(seq 1 20); do
-  systemctl is-active --quiet agentshare.service && break
-  sleep 0.5
+PORT="$(grep -oE '^AGENTSHARE_LISTEN=.*' "$ENV_FILE" | cut -d= -f2- || true)"
+PORT="${PORT##*:}"
+PORT="${PORT:-8080}"
+
+# Wait for the service to actually answer, rather than for systemd to call it
+# active. Those are not the same moment: a unit is reported active as soon as
+# it has exec'd the binary, which is well before the process has bound its
+# listening socket. Checking the unit state here and then firing off a request
+# races itself, and the loser looks exactly like a service that failed to
+# start.
+ready=0
+for _ in $(seq 1 40); do
+  if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 0.25
 done
-if ! systemctl is-active --quiet agentshare.service; then
-  echo "agentshare did not start; last 30 log lines:" >&2
+if [ "$ready" != "1" ]; then
+  echo "agentshare did not answer on 127.0.0.1:$PORT; last 30 log lines:" >&2
   journalctl -u agentshare.service -n 30 --no-pager >&2
   exit 1
 fi
 
-echo "agentshare is ($(systemctl is-active agentshare.service))"
+echo "agentshare is ($(systemctl is-active agentshare.service)) and answering"
 echo "  binary   $BIN_DST"
 echo "  unit     $UNIT_DST"
 echo "  data     $STATE_DIR (owned by a dynamic user; read the token as root)"
 echo "  config   $ENV_FILE"
-
-# Prove it answers, through the address nginx will use.
-PORT="$(grep -oE '^AGENTSHARE_LISTEN=.*' "$ENV_FILE" | cut -d= -f2- || true)"
-PORT="${PORT##*:}"
-if command -v curl >/dev/null 2>&1; then
-  echo
-  echo "  GET /healthz ->"
-  curl -sS --max-time 5 "http://127.0.0.1:${PORT:-8080}/healthz" || echo "  (no answer)"
-  echo
-fi
+echo
+echo "  GET /healthz -> $(curl -sS --max-time 5 "http://127.0.0.1:$PORT/healthz")"
