@@ -10,3 +10,17 @@
 *.db-wal
 admin.token
 agentshare.env
+
+# Loose media in the working tree. This is a Go service and ships no images of
+# its own — a file like this is almost always something about to be uploaded
+# through the service rather than part of the project. One got swept into the
+# public history by `git add -A` after being dropped here for exactly that
+# reason, so the default is now "not tracked". Use `git add -f` for the rare
+# genuine case.
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.mp4
+*.mov
