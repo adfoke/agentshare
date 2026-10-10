@@ -54,7 +54,9 @@ var endpoints = []endpoint{
 	{"GET", "/v1/whoami", "", "what this credential may do"},
 	{"GET", "/v1/stats", ScopeList, "counts and sizes"},
 
-	{"GET", "/s/{token}", "", "download through a share link (no credential needed)"},
+	{"GET", "/s/{token}", "", "a share link: one file downloads, several give an index page"},
+	{"GET", "/s/{token}/", "", "the index page listing a share's files"},
+	{"GET", "/s/{token}/f/{fileID}", "", "one file inside a share"},
 	{"GET", "/s/{token}/info", "", "what is behind a share link, without spending a download"},
 }
 
@@ -123,7 +125,8 @@ func (s *Server) describe(c *gin.Context) {
 			"scheme": "bearer",
 			"how":    "Authorization: Bearer <token>",
 			"also":   "X-API-Key: <token> is accepted as well",
-			"public": []string{"/", "/healthz", "/openapi.json", "/llms.txt", "/s/{token}", "/s/{token}/info"},
+			"public": []string{"/", "/healthz", "/openapi.json", "/llms.txt",
+				"/s/{token}", "/s/{token}/", "/s/{token}/f/{fileID}", "/s/{token}/info"},
 			"scopes": AllScopes,
 		},
 		"limits":    s.limits(c),
@@ -132,7 +135,8 @@ func (s *Server) describe(c *gin.Context) {
 			`upload:  curl -sS -T ./report.pdf -H "Authorization: Bearer $TOKEN" ` +
 				`-H "X-Filename: report.pdf" -H "X-Ttl: 7d" ` + base + `/v1/files`,
 			`share:   curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" ` +
-				`-d '{"file_id":"f_...","ttl":"7d","max_downloads":3}' ` + base + `/v1/shares`,
+				`-d '{"file_ids":["f_...","f_..."],"ttl":"7d","max_downloads":3}' ` + base + `/v1/shares`,
+			`(one file, or several — a share of several opens as an index page in a browser)`,
 			`fetch:   curl -sS -O -J ` + base + `/s/<share-token>`,
 			`list:    curl -sS -H "Authorization: Bearer $TOKEN" "` + base + `/v1/files?limit=20&order=desc"`,
 			`text:    curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" ` +

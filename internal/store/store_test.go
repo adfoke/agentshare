@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -176,8 +178,8 @@ func TestShareDownloadBudget(t *testing.T) {
 	}
 
 	max := int64(2)
-	sh := &Share{ID: "s_1", FileID: "f_1", CreatedAt: 1000, MaxDownloads: &max}
-	if err := s.InsertShare(ctx, sh); err != nil {
+	sh := &Share{ID: "s_1", CreatedAt: 1000, MaxDownloads: &max}
+	if err := s.InsertShare(ctx, sh, []string{"f_1"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,8 +206,8 @@ func TestShareDownloadBudget(t *testing.T) {
 	}
 
 	// An unlimited share never refuses.
-	unlimited := &Share{ID: "s_2", FileID: "f_1", CreatedAt: 1000}
-	if err := s.InsertShare(ctx, unlimited); err != nil {
+	unlimited := &Share{ID: "s_2", CreatedAt: 1000}
+	if err := s.InsertShare(ctx, unlimited, []string{"f_1"}); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < 5; i++ {
@@ -216,20 +218,225 @@ func TestShareDownloadBudget(t *testing.T) {
 	}
 }
 
-func TestDeleteFileCascadesToShares(t *testing.T) {
+// Deleting a file takes it out of every share that listed it, and leaves the
+// share itself alone. The share has to survive because it may cover other files
+// — and even a share of one should answer "this link no longer has any files"
+// rather than "no such link", which would suggest the recipient has the wrong
+// URL.
+func TestDeletingAFileRemovesItFromItsShares(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
-	if err := s.InsertFile(ctx, file("f_1", "aa", "a.txt", 1000)); err != nil {
+	for _, f := range []*File{file("f_1", "aa", "a.txt", 1000), file("f_2", "bb", "b.txt", 1001)} {
+		if err := s.InsertFile(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.InsertShare(ctx, &Share{ID: "s_1", CreatedAt: 1000}, []string{"f_1", "f_2"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.InsertShare(ctx, &Share{ID: "s_1", FileID: "f_1", CreatedAt: 1000}); err != nil {
-		t.Fatal(err)
-	}
+
 	if _, err := s.DeleteFile(ctx, "f_1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ShareByID(ctx, "s_1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("share survived its file: %v", err)
+	if _, err := s.ShareByID(ctx, "s_1"); err != nil {
+		t.Fatalf("the share should outlive one of its files: %v", err)
+	}
+	items, err := s.ShareItems(ctx, "s_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ID != "f_2" {
+		t.Fatalf("after deleting f_1 the share holds %d items, want just f_2", len(items))
+	}
+
+	// The share survives losing its last file too; it simply resolves to none.
+	if _, err := s.DeleteFile(ctx, "f_2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ShareByID(ctx, "s_1"); err != nil {
+		t.Fatalf("the share should still exist with no files: %v", err)
+	}
+	if items, err := s.ShareItems(ctx, "s_1"); err != nil || len(items) != 0 {
+		t.Fatalf("ShareItems = %d items, %v; want 0, nil", len(items), err)
+	}
+}
+
+func TestShareItemsKeepsOrderAndSkipsExpired(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+
+	past := time.Now().Add(-time.Hour).Unix()
+	for _, f := range []*File{
+		file("f_c", "cc", "c.txt", 1000),
+		file("f_a", "aa", "a.txt", 1000),
+		file("f_b", "bb", "b.txt", 1000),
+	} {
+		if err := s.InsertFile(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dead := file("f_dead", "dd", "dead.txt", 1000)
+	dead.ExpiresAt = &past
+	if err := s.InsertFile(ctx, dead); err != nil {
+		t.Fatal(err)
+	}
+
+	// Deliberately not alphabetical: the index page must list them in the order
+	// the caller named, which is the order they care about.
+	order := []string{"f_c", "f_a", "f_b", "f_dead"}
+	if err := s.InsertShare(ctx, &Share{ID: "s_1", CreatedAt: 1000}, order); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := s.ShareItems(ctx, "s_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, f := range items {
+		got = append(got, f.ID)
+	}
+	want := "f_c,f_a,f_b"
+	if joined := strings.Join(got, ","); joined != want {
+		t.Fatalf("ShareItems = %s, want %s (insertion order, expired left out)", joined, want)
+	}
+
+	// ItemCount still counts what was shared, which is what lets the index page
+	// say how many files are hidden.
+	sh, err := s.ShareByID(ctx, "s_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sh.ItemCount != 4 {
+		t.Fatalf("ItemCount = %d, want 4", sh.ItemCount)
+	}
+	if !s.shareCovers(t, "s_1", "f_dead") {
+		t.Fatal("ShareCovers should answer for every member, expired or not")
+	}
+}
+
+// shareCovers is a tiny helper so the assertion above reads as one line.
+func (s *Store) shareCovers(t *testing.T, shareID, fileID string) bool {
+	t.Helper()
+	ok, err := s.ShareCovers(context.Background(), shareID, fileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ok
+}
+
+func TestShareRefusesToCoverNothing(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t)
+	if err := s.InsertShare(ctx, &Share{ID: "s_1", CreatedAt: 1000}, nil); err == nil {
+		t.Fatal("a share with no files was accepted; it would be a link to nothing")
+	}
+}
+
+// The deployed database was created before a share could hold more than one
+// file, so its shares table has file_id NOT NULL and nothing records membership
+// anywhere else. Opening that file has to move the data, and this is the test
+// that says so — the alternative is finding out on the server.
+func TestMigrationMovesSingleFileSharesToShareItems(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	// Build the old shape by hand, exactly as the previous release created it.
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE files (
+			id TEXT PRIMARY KEY, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+			name TEXT NOT NULL DEFAULT '', content_type TEXT NOT NULL DEFAULT '',
+			tags TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}',
+			owner TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+			expires_at INTEGER, downloads INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE shares (
+			id TEXT PRIMARY KEY,
+			file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+			label TEXT NOT NULL DEFAULT '', owner TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL, expires_at INTEGER,
+			max_downloads INTEGER, downloads INTEGER NOT NULL DEFAULT 0)`,
+		`INSERT INTO files (id, sha256, size, name, content_type, created_at) VALUES
+			('f_1','aa',10,'one.txt','text/plain',1000),
+			('f_2','bb',20,'two.txt','text/plain',1000)`,
+		`INSERT INTO shares (id, file_id, label, created_at, max_downloads) VALUES
+			('s_1','f_1','legacy label',1000,5),
+			('s_2','f_2','',1001,NULL)`,
+		`PRAGMA user_version = 0`,
+	} {
+		if _, err := raw.Exec(stmt); err != nil {
+			t.Fatalf("building the legacy schema: %v", err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opening with this build is what migrates it.
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a legacy database: %v", err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	for _, tc := range []struct{ share, fileID, label string }{
+		{"s_1", "f_1", "legacy label"},
+		{"s_2", "f_2", ""},
+	} {
+		sh, err := st.ShareByID(ctx, tc.share)
+		if err != nil {
+			t.Fatalf("%s did not survive the migration: %v", tc.share, err)
+		}
+		if sh.Label != tc.label {
+			t.Errorf("%s label = %q, want %q", tc.share, sh.Label, tc.label)
+		}
+		if sh.ItemCount != 1 {
+			t.Errorf("%s item count = %d, want 1", tc.share, sh.ItemCount)
+		}
+		items, err := st.ShareItems(ctx, tc.share)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || items[0].ID != tc.fileID {
+			t.Errorf("%s covers %v, want exactly %s", tc.share, items, tc.fileID)
+		}
+	}
+
+	// The single-file share kept its download budget, which lived in a column
+	// the rebuild had to carry across.
+	if sh, _ := st.ShareByID(ctx, "s_1"); sh.MaxDownloads == nil || *sh.MaxDownloads != 5 {
+		t.Errorf("max_downloads did not survive: %+v", sh.MaxDownloads)
+	}
+
+	// And the new capability works on the migrated database.
+	if err := st.InsertShare(ctx, &Share{ID: "s_3", CreatedAt: 2000},
+		[]string{"f_1", "f_2"}); err != nil {
+		t.Fatal(err)
+	}
+	if items, err := st.ShareItems(ctx, "s_3"); err != nil || len(items) != 2 {
+		t.Fatalf("a multi-file share on a migrated database holds %d items, %v", len(items), err)
+	}
+
+	// Re-opening must be a no-op rather than migrating twice.
+	st.Close()
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("re-opening the migrated database: %v", err)
+	}
+	defer again.Close()
+	if items, err := again.ShareItems(ctx, "s_3"); err != nil || len(items) != 2 {
+		t.Fatalf("after a second open the share holds %d items, %v", len(items), err)
+	}
+	var version int
+	if err := again.db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != schemaVersion {
+		t.Errorf("user_version = %d, want %d", version, schemaVersion)
 	}
 }
 
@@ -283,7 +490,7 @@ func TestSweepExpired(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.InsertShare(ctx, &Share{ID: "s_exp", FileID: "f_live", CreatedAt: 1000, ExpiresAt: &past}); err != nil {
+	if err := s.InsertShare(ctx, &Share{ID: "s_exp", CreatedAt: 1000, ExpiresAt: &past}, []string{"f_live"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertToken(ctx, &Token{ID: "t_exp", CreatedAt: 1000, ExpiresAt: &past}, "hash"); err != nil {

@@ -74,6 +74,45 @@ AGENTSHARE_ADMIN_TOKEN=$T ./scripts/smoke.sh $B
 
 token 秘密只在创建那一次返回，之后只能吊销不能取回（库里存的是 SHA-256）。
 
+## 分享链接：一个文件，或者一整个列表
+
+分享链接是**能力链接** —— 谁拿到 `/s/<token>` 谁就能访问它覆盖的文件，不需要任何凭据。
+一条链接可以覆盖**多个文件**，这时它打开就是一个**文件列表页**：
+
+```
+一个文件  ->  /s/<token> 直接就是那个文件的字节（可下载）
+多个文件  ->  /s/<token> 是一个 HTML 索引页，列出所有文件
+```
+
+```bash
+# 传一批文件，给一条链接
+curl -sS -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/json' \
+  -d '{"file_ids":["f_aaa","f_bbb","f_ccc"],"ttl":"7d","label":"v1.0 发布"}' \
+  \$B/v1/shares
+# -> share.url 打开就是列表页
+```
+
+| 路径 | 作用 |
+|---|---|
+| `/s/<token>` | 单文件 → 字节；多文件 → 索引页。`?list=1` 强制索引页 |
+| `/s/<token>/` | **总是**索引页 |
+| `/s/<token>/f/<file_id>` | 取列表里的某个文件（`?inline=1` 可内联显示） |
+| `/s/<token>/info` | JSON：成员清单、大小、摘要、剩余下载次数（不消耗次数） |
+
+**链接的形态在创建时就定死了**，不会因为成员过期或被删而改变 ——
+一条发出去当"列表"的链接，永远还是列表，不会某天变成"直接下载某个文件"。
+
+### 索引页的取舍（这是全站唯一的 HTML）
+
+它长得像 nginx `autoindex`：等宽、密排、名称/时间/大小三列、按上传时给的顺序。
+
+- **零 JavaScript**，纯服务端生成，带 `CSP: default-src 'none'`。
+- **文件名一律转义** —— 文件名来自上传的人，`html/template` 保证 `<img onerror=…>`
+  这种名字只会被显示、不会被执行。有回归测试盯着（注入 `text/template` 会立刻挂）。
+- **它链接的文件仍然是 `attachment`** —— 页面是我们生成的、可信，
+  但用户传上来的东西一律不内联渲染，所以传个 HTML 上来也不会在你的域名下跑脚本。
+- 过期的成员**从列表里隐去**并在页脚说明有几个被隐藏；**全部过期则整条链接回 410**。
+
 ## API 一览
 
 公开（无需凭据）：`GET /` `GET /healthz` `GET /openapi.json` `GET /llms.txt`
@@ -90,7 +129,7 @@ token 秘密只在创建那一次返回，之后只能吊销不能取回（库�
 | DELETE | `/v1/files/{id}` | delete | 删除，连带吊销它的所有分享链接 |
 | GET | `/v1/content/{sha256}` | download | 按摘要下载（不需要知道文件 id） |
 | GET | `/v1/content/{sha256}/meta` | download | 问「这些字节你有吗」，不传输内容 |
-| POST | `/v1/shares` | share | 建分享链接：`ttl`、`max_downloads`、`label` |
+| POST | `/v1/shares` | share | 建分享链接：`file_id` 或 `file_ids`，加 `ttl`、`max_downloads`、`label` |
 | GET | `/v1/shares` | share | 列分享链接（可按 `file_id` 过滤） |
 | DELETE | `/v1/shares/{id}` | share | 吊销 |
 | POST | `/v1/tokens` | admin | 签发受管 token |
@@ -98,8 +137,10 @@ token 秘密只在创建那一次返回，之后只能吊销不能取回（库�
 | DELETE | `/v1/tokens/{id}` | admin | 吊销 |
 | GET | `/v1/whoami` | — | 当前凭据的身份和 scopes |
 | GET | `/v1/stats` | list | 计数与占用 |
-| GET/HEAD | `/s/{token}` | — | 凭分享链接下载（HEAD 不消耗下载次数） |
-| GET | `/s/{token}/info` | — | 看看链接后面是什么，不消耗次数 |
+| GET/HEAD | `/s/{token}` | — | 打开分享链接：单文件给字节，多文件给列表页 |
+| GET | `/s/{token}/` | — | 总是列表页 |
+| GET | `/s/{token}/f/{fileID}` | — | 取列表里的某个文件（HEAD 不消耗下载次数） |
+| GET | `/s/{token}/info` | — | JSON 清单，不消耗次数 |
 
 上传时的元数据走 header，也可以全部改走 query string（有些 agent 框架更愿意拼 URL）：
 

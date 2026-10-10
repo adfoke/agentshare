@@ -47,17 +47,30 @@ var schema = []string{
 
 	`CREATE TABLE IF NOT EXISTS shares (
 		id            TEXT PRIMARY KEY,
-		file_id       TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
 		label         TEXT NOT NULL DEFAULT '',
 		owner         TEXT NOT NULL DEFAULT '',
 		created_at    INTEGER NOT NULL,
 		expires_at    INTEGER,
 		max_downloads INTEGER,
-		downloads     INTEGER NOT NULL DEFAULT 0
+		downloads     INTEGER NOT NULL DEFAULT 0,
+		kind          TEXT NOT NULL DEFAULT 'file'
 	)`,
-	`CREATE INDEX IF NOT EXISTS idx_shares_file ON shares(file_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_shares_created ON shares(created_at DESC, id DESC)`,
 	`CREATE INDEX IF NOT EXISTS idx_shares_expires ON shares(expires_at)`,
+
+	// A share covers a set of files, so the membership lives beside it rather
+	// than in a column on it. ON DELETE CASCADE on file_id is what makes
+	// deleting a file quietly remove it from every share that listed it —
+	// and deliberately not the other way round: the share itself survives, so
+	// a link to a set of files keeps working when one of them goes away.
+	`CREATE TABLE IF NOT EXISTS share_items (
+		share_id TEXT NOT NULL REFERENCES shares(id) ON DELETE CASCADE,
+		file_id  TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+		position INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (share_id, file_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_share_items_file ON share_items(file_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_share_items_share ON share_items(share_id, position)`,
 
 	`CREATE TABLE IF NOT EXISTS tokens (
 		id          TEXT PRIMARY KEY,
@@ -96,6 +109,10 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("apply schema: %w", err)
 		}
+	}
+	if err := migrate(context.Background(), db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -352,16 +369,36 @@ func (s *Store) BumpFileDownloads(ctx context.Context, id string) error {
 
 // ---------------------------------------------------------------- shares
 
-// Share is one capability URL: whoever holds the id may download the file.
+// Kinds of share. A share's shape is fixed when it is created rather than
+// derived from how many of its members happen to be alive right now.
+//
+// That distinction matters more than it looks: a link handed out as a listing
+// must keep opening as a listing even after some of its files expire. Deriving
+// the shape from the live count instead would silently turn that link into a
+// download of whichever file survived, which is not what the recipient
+// bookmarked and not what the sender described.
+const (
+	ShareKindFile = "file" // one file: the URL serves its bytes
+	ShareKindSet  = "set"  // several files: the URL serves an index page
+)
+
+// Share is one capability URL: whoever holds the id may reach the files it
+// covers, with no credential of their own.
 type Share struct {
 	ID           string
-	FileID       string
 	Label        string
 	Owner        string
 	CreatedAt    int64
 	ExpiresAt    *int64
 	MaxDownloads *int64
 	Downloads    int64
+	// Kind is ShareKindFile or ShareKindSet.
+	Kind string
+
+	// ItemCount is how many files the share covers, expired ones included. It
+	// is filled in by the queries that ask for it and left zero by the ones
+	// that do not.
+	ItemCount int
 }
 
 // Expired reports whether the share's own lifetime has run out at t.
@@ -374,7 +411,18 @@ func (sh *Share) Exhausted() bool {
 	return sh.MaxDownloads != nil && sh.Downloads >= *sh.MaxDownloads
 }
 
-const shareCols = `id, file_id, label, owner, created_at, expires_at, max_downloads, downloads`
+// ServesBytes reports whether the share URL itself serves a file rather than
+// an index page.
+func (sh *Share) ServesBytes() bool { return sh.Kind != ShareKindSet }
+
+// shareCols is the writable column list: it is used verbatim in INSERT.
+const shareCols = `id, label, owner, created_at, expires_at, max_downloads, downloads, kind`
+
+// shareSelect is the same columns for reading, plus the membership count. They
+// are kept apart on purpose — a query embedded in an INSERT column list is a
+// syntax error, not a convenience.
+const shareSelect = shareCols + `,
+	(SELECT COUNT(*) FROM share_items WHERE share_items.share_id = shares.id)`
 
 func scanShare(sc interface{ Scan(...any) error }) (*Share, error) {
 	var (
@@ -382,7 +430,8 @@ func scanShare(sc interface{ Scan(...any) error }) (*Share, error) {
 		exp sql.NullInt64
 		max sql.NullInt64
 	)
-	err := sc.Scan(&sh.ID, &sh.FileID, &sh.Label, &sh.Owner, &sh.CreatedAt, &exp, &max, &sh.Downloads)
+	err := sc.Scan(&sh.ID, &sh.Label, &sh.Owner, &sh.CreatedAt, &exp, &max,
+		&sh.Downloads, &sh.Kind, &sh.ItemCount)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -400,18 +449,84 @@ func scanShare(sc interface{ Scan(...any) error }) (*Share, error) {
 	return &sh, nil
 }
 
-// InsertShare stores a new share link.
-func (s *Store) InsertShare(ctx context.Context, sh *Share) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO shares (`+shareCols+`) VALUES (?,?,?,?,?,?,?,?)`,
-		sh.ID, sh.FileID, sh.Label, sh.Owner, sh.CreatedAt,
-		nullable(sh.ExpiresAt), nullable(sh.MaxDownloads), sh.Downloads)
-	return err
+// InsertShare stores a new share link and the files it covers, in one
+// transaction: a share that exists without its members would be a link that
+// resolves to nothing.
+//
+// The order of fileIDs is preserved, because it is the order the index page
+// lists them in and the caller uploaded them in a meaningful sequence.
+func (s *Store) InsertShare(ctx context.Context, sh *Share, fileIDs []string) error {
+	if len(fileIDs) == 0 {
+		return errors.New("a share must cover at least one file")
+	}
+	if sh.Kind == "" {
+		sh.Kind = ShareKindFile
+		if len(fileIDs) > 1 {
+			sh.Kind = ShareKindSet
+		}
+	}
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO shares (`+shareCols+`) VALUES (?,?,?,?,?,?,?,?)`,
+			sh.ID, sh.Label, sh.Owner, sh.CreatedAt,
+			nullable(sh.ExpiresAt), nullable(sh.MaxDownloads), sh.Downloads, sh.Kind); err != nil {
+			return err
+		}
+		// A repeated file id would violate the primary key and abort the whole
+		// share; the caller's list is deduplicated before it gets here, and
+		// OR IGNORE keeps that from being a load-bearing assumption.
+		for pos, id := range fileIDs {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT OR IGNORE INTO share_items (share_id, file_id, position) VALUES (?,?,?)`,
+				sh.ID, id, pos); err != nil {
+				return err
+			}
+		}
+		sh.ItemCount = len(fileIDs)
+		return nil
+	})
 }
 
 // ShareByID looks up a share link.
 func (s *Store) ShareByID(ctx context.Context, id string) (*Share, error) {
-	return scanShare(s.db.QueryRowContext(ctx, `SELECT `+shareCols+` FROM shares WHERE id = ?`, id))
+	return scanShare(s.db.QueryRowContext(ctx, `SELECT `+shareSelect+` FROM shares WHERE id = ?`, id))
+}
+
+// ShareItems returns the live files a share covers, in the order they were
+// added. Files that have expired are left out: a listing should not offer
+// something that can no longer be downloaded. Files that were deleted are gone
+// from the table entirely, so their slots simply do not appear.
+func (s *Store) ShareItems(ctx context.Context, shareID string) ([]*File, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+fileCols+` FROM files
+		 JOIN share_items ON share_items.file_id = files.id
+		 WHERE share_items.share_id = ? AND (files.expires_at IS NULL OR files.expires_at > ?)
+		 ORDER BY share_items.position, files.id`,
+		shareID, time.Now().Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []*File
+	for rows.Next() {
+		f, err := scanFile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// Covers reports whether a file is one of the share's members, which is what
+// gates a per-file download inside a share.
+func (s *Store) ShareCovers(ctx context.Context, shareID, fileID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM share_items WHERE share_id = ? AND file_id = ?`,
+		shareID, fileID).Scan(&n)
+	return n > 0, err
 }
 
 // ReserveShareDownload consumes one download credit, atomically. It returns
@@ -431,17 +546,19 @@ func (s *Store) ReserveShareDownload(ctx context.Context, id string) (bool, erro
 	return n == 1, nil
 }
 
-// ListShares returns the shares belonging to one file.
+// ListShares returns share links, newest first, optionally only those covering
+// a particular file.
 func (s *Store) ListShares(ctx context.Context, fileID string, limit int) ([]*Share, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
 	var (
-		q    = `SELECT ` + shareCols + ` FROM shares`
+		q    = `SELECT ` + shareSelect + ` FROM shares`
 		args []any
 	)
 	if fileID != "" {
-		q += ` WHERE file_id = ?`
+		q += ` WHERE EXISTS (SELECT 1 FROM share_items
+		         WHERE share_items.share_id = shares.id AND share_items.file_id = ?)`
 		args = append(args, fileID)
 	}
 	q += ` ORDER BY created_at DESC, id DESC LIMIT ?`
@@ -463,7 +580,7 @@ func (s *Store) ListShares(ctx context.Context, fileID string, limit int) ([]*Sh
 	return out, rows.Err()
 }
 
-// DeleteShare revokes a share link.
+// DeleteShare revokes a share link. The members go with it by cascade.
 func (s *Store) DeleteShare(ctx context.Context, id string) error {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM shares WHERE id = ?`, id)
 	if err != nil {

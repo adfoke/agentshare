@@ -1068,6 +1068,419 @@ func TestShareLifecycle(t *testing.T) {
 	resp.Body.Close()
 }
 
+// A share covering several files opens as an index page. This is the shape a
+// "here is a set of things" hand-off needs, and it is the only HTML this
+// service produces.
+func TestMultiFileShareOpensAsAnIndexPage(t *testing.T) {
+	e := newTestEnv(t, nil)
+
+	ids := make([]string, 0, 3)
+	names := []string{"app-linux-amd64", "app-darwin-arm64", "SHA256SUMS"}
+	sizes := []int{1200, 1300, 40}
+	for i, name := range names {
+		_, up := e.upload(bytes.Repeat([]byte("x"), sizes[i]), name)
+		ids = append(ids, fileOf(t, up)["id"].(string))
+	}
+
+	resp := e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_ids": ids, "label": "release 1.0"}),
+		withHeader("Content-Type", "application/json"))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create share = %d: %s", resp.StatusCode, readBody(t, resp))
+	}
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, resp, &created)
+	token := created.Share["id"].(string)
+
+	if got := created.Share["file_count"].(float64); got != 3 {
+		t.Errorf("file_count = %v, want 3", got)
+	}
+	if _, ok := created.Share["file"]; ok {
+		t.Error("a share of several files should not carry the single-file field")
+	}
+	if got := len(created.Share["file_ids"].([]any)); got != 3 {
+		t.Errorf("file_ids has %d entries, want 3", got)
+	}
+
+	// The share URL itself is the index page.
+	resp = e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /s/<token> = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", ct)
+	}
+	// A page we generate must not be able to become a script host.
+	if csp := resp.Header.Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+		t.Errorf("the index page has no usable CSP: %q", csp)
+	}
+	body := readBody(t, resp)
+	for _, name := range names {
+		if !strings.Contains(body, name) {
+			t.Errorf("the index does not list %q", name)
+		}
+	}
+	if !strings.Contains(body, "release 1.0") {
+		t.Error("the index does not show the share's label")
+	}
+	// Every row links into the share's own file route.
+	for _, id := range ids {
+		if !strings.Contains(body, "/s/"+token+"/f/"+id) {
+			t.Errorf("the index does not link to %s", id)
+		}
+	}
+
+	// The trailing-slash form is the same page, which is what a browser ends up
+	// requesting after any relative navigation.
+	resp = e.do(http.MethodGet, "/s/"+token+"/", nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") {
+		t.Fatalf("GET /s/<token>/ = %d %s, want the index page",
+			resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	resp.Body.Close()
+
+	// And each member downloads, byte for byte.
+	resp = e.do(http.MethodGet, "/s/"+token+"/f/"+ids[1], nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("download a member = %d", resp.StatusCode)
+	}
+	if got, want := readBody(t, resp), strings.Repeat("x", sizes[1]); got != want {
+		t.Fatalf("member bytes are %d long, want %d", len(got), len(want))
+	}
+}
+
+// The token is what scopes a share. A file that is not a member must not be
+// reachable through it, or the capability would be the whole store.
+func TestShareOnlyServesItsOwnMembers(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, in := e.upload([]byte("inside"), "in.txt")
+	_, out := e.upload([]byte("outside"), "out.txt")
+	insideID := fileOf(t, in)["id"].(string)
+	outsideID := fileOf(t, out)["id"].(string)
+
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_ids": []string{insideID, insideID, "  " + insideID + " "}}),
+		withHeader("Content-Type", "application/json")), &created)
+	token := created.Share["id"].(string)
+
+	// Repeats and whitespace collapse rather than creating a second row.
+	if got := created.Share["file_count"].(float64); got != 1 {
+		t.Fatalf("file_count = %v after naming one file three times, want 1", got)
+	}
+
+	resp := e.do(http.MethodGet, "/s/"+token+"/f/"+outsideID, nil, withoutAuth())
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("a non-member file = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = e.do(http.MethodGet, "/s/"+token+"/f/"+insideID, nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the member file = %d, want 200", resp.StatusCode)
+	}
+	if got := readBody(t, resp); got != "inside" {
+		t.Fatalf("member bytes = %q", got)
+	}
+}
+
+// The page is built from a file name, and a file name comes from whoever
+// uploaded the file. Escaping is the only thing standing between that and
+// script execution on this service's own origin.
+func TestIndexPageEscapesFileNames(t *testing.T) {
+	e := newTestEnv(t, nil)
+
+	// No slash in either name on purpose: sanitizeName treats "/" as a path
+	// separator and keeps only the last segment, so a name written as
+	// "<script>a</script>" would be stored as "script>" and the test would be
+	// checking a string nobody ever uploaded. (That truncation is worth knowing
+	// about on its own — it is why a name cannot look like a path.)
+	hostile := `<img src=x onerror=alert(document.domain)>`
+	_, up := e.upload([]byte("contents"), hostile)
+	ids := []string{fileOf(t, up)["id"].(string)}
+
+	// A second file, whose name would break out of an attribute if it were
+	// interpolated unescaped.
+	quote := `a" onmouseover="alert(1)`
+	_, up2 := e.upload([]byte("contents"), quote)
+	ids = append(ids, fileOf(t, up2)["id"].(string))
+
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, e.do(http.MethodPost, "/v1/shares", mustJSON(t, map[string]any{"file_ids": ids}),
+		withHeader("Content-Type", "application/json")), &created)
+
+	resp := e.do(http.MethodGet, "/s/"+created.Share["id"].(string), nil, withoutAuth())
+	body := readBody(t, resp)
+
+	if strings.Contains(body, "<img src=x") {
+		t.Fatal("a file name was interpolated into the page as markup")
+	}
+	if !strings.Contains(body, "&lt;img src=x onerror=alert(document.domain)&gt;") {
+		t.Error("the hostile name is not present in escaped form either; it may have vanished")
+	}
+	if strings.Contains(body, `a" onmouseover=`) {
+		t.Error("a file name broke out of an attribute")
+	}
+	if !strings.Contains(body, "a&#34; onmouseover=") {
+		t.Error("expected the quote in the name to be escaped")
+	}
+	// The page we generate carries no script of its own, which is what makes
+	// an assertion about injected script meaningful.
+	if strings.Contains(body, "<script") {
+		t.Error("the generated page contains a script element")
+	}
+}
+
+// A file that has expired stays out of the listing rather than being offered
+// and then failing; a share whose members have all gone says so.
+func TestIndexPageHidesExpiredMembers(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, a := e.upload([]byte("aaa"), "live.txt")
+	_, b := e.upload([]byte("bbb"), "dying.txt")
+	liveID := fileOf(t, a)["id"].(string)
+	dyingID := fileOf(t, b)["id"].(string)
+
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_ids": []string{liveID, dyingID}}),
+		withHeader("Content-Type", "application/json")), &created)
+	token := created.Share["id"].(string)
+
+	past := time.Now().Add(-time.Minute).Unix()
+	if _, err := e.store.DB().Exec(`UPDATE files SET expires_at = ? WHERE id = ?`, past, dyingID); err != nil {
+		t.Fatal(err)
+	}
+
+	resp := e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+	body := readBody(t, resp)
+	if strings.Contains(body, "dying.txt") {
+		t.Error("an expired file is still listed")
+	}
+	if !strings.Contains(body, "live.txt") {
+		t.Error("the live file fell out of the listing too")
+	}
+	if !strings.Contains(body, "1 个文件已过期") {
+		t.Error("the page does not say that a file was hidden")
+	}
+
+	// Direct access to the expired member is gone, not merely unlisted.
+	resp = e.do(http.MethodGet, "/s/"+token+"/f/"+dyingID, nil, withoutAuth())
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("an expired member = %d, want 410", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// A share with nothing left says so instead of rendering an empty page.
+	if _, err := e.store.DB().Exec(`UPDATE files SET expires_at = ? WHERE id = ?`, past, liveID); err != nil {
+		t.Fatal(err)
+	}
+	resp = e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("a share whose files have all expired = %d, want 410", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// A share of one file keeps behaving exactly as it did, because that is what
+// every link handed out so far is.
+// A share's shape is fixed when it is created. Losing members — whether they
+// expire or are deleted outright — must not turn a listing into a download,
+// because that is the same URL quietly becoming a different thing.
+func TestAShareStaysAListingWhenItLosesMembers(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(e *testEnv, fileID string)
+	}{
+		{"expired", func(e *testEnv, fileID string) {
+			past := time.Now().Add(-time.Minute).Unix()
+			if _, err := e.store.DB().Exec(`UPDATE files SET expires_at = ? WHERE id = ?`, past, fileID); err != nil {
+				e.t.Fatal(err)
+			}
+		}},
+		{"deleted", func(e *testEnv, fileID string) {
+			if resp := e.do(http.MethodDelete, "/v1/files/"+fileID, nil); resp.StatusCode != http.StatusOK {
+				e.t.Fatalf("delete = %d", resp.StatusCode)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEnv(t, nil)
+			_, a := e.upload([]byte("aaa"), "keep.txt")
+			_, b := e.upload([]byte("bbb"), "loss.txt")
+			keepID := fileOf(t, a)["id"].(string)
+
+			var created struct {
+				Share map[string]any `json:"share"`
+			}
+			decode(t, e.do(http.MethodPost, "/v1/shares",
+				mustJSON(t, map[string]any{"file_ids": []string{keepID, fileOf(t, b)["id"].(string)}}),
+				withHeader("Content-Type", "application/json")), &created)
+			token := created.Share["id"].(string)
+
+			tc.remove(e, fileOf(t, b)["id"].(string))
+
+			// One file is left, but the link was handed out as a listing.
+			resp := e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+			ct := resp.Header.Get("Content-Type")
+			if !strings.HasPrefix(ct, "text/html") {
+				t.Fatalf("after a member was %s the link served %q, want the index page",
+					tc.name, ct)
+			}
+			if body := readBody(t, resp); !strings.Contains(body, "keep.txt") {
+				t.Error("the surviving file is not listed")
+			}
+		})
+	}
+}
+
+func TestSingleFileShareStillDownloads(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, up := e.upload([]byte("just the one"), "solo.txt")
+	id := fileOf(t, up)["id"].(string)
+
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, e.do(http.MethodPost, "/v1/shares", mustJSON(t, map[string]any{"file_id": id}),
+		withHeader("Content-Type", "application/json")), &created)
+	token := created.Share["id"].(string)
+
+	if _, ok := created.Share["file"]; !ok {
+		t.Error("a share of one file should still carry the file object")
+	}
+
+	resp := e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+	if got := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(got, "attachment") {
+		t.Fatalf("Content-Disposition = %q, want an attachment", got)
+	}
+	if got := readBody(t, resp); got != "just the one" {
+		t.Fatalf("bytes = %q", got)
+	}
+
+	// ?list=1 asks for the page anyway, which is how a single file can be
+	// presented as a listing when that is what the sender wants.
+	resp = e.do(http.MethodGet, "/s/"+token+"?list=1", nil, withoutAuth())
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("?list=1 Content-Type = %q, want text/html", ct)
+	}
+	if body := readBody(t, resp); !strings.Contains(body, "solo.txt") {
+		t.Error("the forced listing does not name the file")
+	}
+
+	// The trailing-slash form is always the page.
+	resp = e.do(http.MethodGet, "/s/"+token+"/", nil, withoutAuth())
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("/s/<token>/ Content-Type = %q, want text/html", ct)
+	}
+	resp.Body.Close()
+
+	// The member route works for a share of one too.
+	resp = e.do(http.MethodGet, "/s/"+token+"/f/"+id, nil, withoutAuth())
+	if got := readBody(t, resp); got != "just the one" {
+		t.Fatalf("member bytes = %q", got)
+	}
+}
+
+// The download budget counts files served, not page views: opening the index
+// is how a recipient finds out what is there, and charging for that would make
+// a budget of three unusable for a share of three.
+func TestOpeningTheIndexDoesNotSpendADownload(t *testing.T) {
+	e := newTestEnv(t, nil)
+	var ids []string
+	for _, name := range []string{"a.txt", "b.txt"} {
+		_, up := e.upload([]byte(name), name)
+		ids = append(ids, fileOf(t, up)["id"].(string))
+	}
+
+	var created struct {
+		Share map[string]any `json:"share"`
+	}
+	decode(t, e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_ids": ids, "max_downloads": 1}),
+		withHeader("Content-Type", "application/json")), &created)
+	token := created.Share["id"].(string)
+
+	for i := 0; i < 3; i++ {
+		resp := e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("index view %d = %d, want 200", i+1, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	var info struct {
+		Share struct {
+			Downloads     int64 `json:"downloads"`
+			DownloadsLeft int64 `json:"downloads_left"`
+			FileCount     int   `json:"file_count"`
+		} `json:"share"`
+		Files []struct {
+			Name string `json:"name"`
+		} `json:"files"`
+	}
+	decode(t, e.do(http.MethodGet, "/s/"+token+"/info", nil, withoutAuth()), &info)
+	if info.Share.Downloads != 0 {
+		t.Fatalf("viewing the index spent %d download(s)", info.Share.Downloads)
+	}
+	if info.Share.FileCount != 2 || len(info.Files) != 2 {
+		t.Fatalf("info reports %d files (%d listed), want 2",
+			info.Share.FileCount, len(info.Files))
+	}
+
+	// The one credit is still there for an actual download.
+	resp := e.do(http.MethodGet, "/s/"+token+"/f/"+ids[0], nil, withoutAuth())
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the download the budget was for = %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// And now it is spent.
+	resp = e.do(http.MethodGet, "/s/"+token+"/f/"+ids[1], nil, withoutAuth())
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("past the budget = %d, want 403", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+func TestCreatingAShareValidatesEveryFile(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, up := e.upload([]byte("real"), "real.txt")
+	realID := fileOf(t, up)["id"].(string)
+
+	resp := e.do(http.MethodPost, "/v1/shares",
+		mustJSON(t, map[string]any{"file_ids": []string{realID, "f_nope"}}),
+		withHeader("Content-Type", "application/json"))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("a share naming an unknown file = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Nothing was written: a share that silently drops what it cannot find
+	// would leave the sender believing the recipient has everything.
+	var list struct {
+		Count int `json:"count"`
+	}
+	decode(t, e.do(http.MethodGet, "/v1/shares", nil), &list)
+	if list.Count != 0 {
+		t.Fatalf("%d share(s) were created by a failed request", list.Count)
+	}
+
+	resp = e.do(http.MethodPost, "/v1/shares", mustJSON(t, map[string]any{}),
+		withHeader("Content-Type", "application/json"))
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("a share naming no files = %d, want 400", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
 func TestUnknownShareToken(t *testing.T) {
 	e := newTestEnv(t, nil)
 	resp := e.do(http.MethodGet, "/s/aaaaaaaaaaaaaaaaaaaaaaaaaa", nil, withoutAuth())
@@ -1138,11 +1551,16 @@ func TestDeletingFileRevokesItsShares(t *testing.T) {
 	resp = e.do(http.MethodDelete, "/v1/files/"+id, nil)
 	resp.Body.Close()
 
+	// The link says what actually happened. A share whose files are gone
+	// answers 410 — "this link no longer has anything in it" — rather than 404,
+	// which would send the recipient looking for a typo in the URL.
 	resp = e.do(http.MethodGet, "/s/"+token, nil, withoutAuth())
-	if resp.StatusCode == http.StatusOK {
-		t.Fatal("a share link outlived the file it pointed at")
+	if resp.StatusCode != http.StatusGone {
+		t.Fatalf("a share whose file was deleted = %d, want 410", resp.StatusCode)
 	}
-	resp.Body.Close()
+	if code := failCode(t, resp); code != codeGone {
+		t.Fatalf("code = %s, want %s", code, codeGone)
+	}
 }
 
 func TestShareRequiresExistingFile(t *testing.T) {

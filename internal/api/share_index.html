@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow, noarchive">
+<title>{{.Title}}</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1b1d1f;
+    --dim: #6b7075;
+    --line: #e2e5e8;
+    --bg: #ffffff;
+    --alt: #f7f8f9;
+    --href: #0b62c4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e9eaeb;
+      --dim: #949a9f;
+      --line: #2e3235;
+      --bg: #131517;
+      --alt: #1a1d1f;
+      --href: #6cb2ff;
+    }
+  }
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 {
+    margin: 0 0 4px;
+    font-size: 18px;
+    font-weight: 600;
+    word-break: break-all;
+  }
+  h1::before { content: "Index of "; color: var(--dim); font-weight: 400; }
+  .meta { color: var(--dim); font-size: 12.5px; margin-bottom: 18px; }
+  .meta b { font-weight: 600; color: var(--fg); }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: 5px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th {
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--dim);
+    border-bottom-width: 2px;
+  }
+  tbody tr:nth-child(even) { background: var(--alt); }
+  td.name { word-break: break-all; }
+  td.name a { color: var(--href); text-decoration: none; }
+  td.name a:hover { text-decoration: underline; }
+  td.num { white-space: nowrap; text-align: right; color: var(--dim); }
+  td.date { white-space: nowrap; color: var(--dim); }
+  .empty { padding: 24px 10px; color: var(--dim); }
+  footer { margin-top: 28px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--dim); font-size: 12.5px; }
+  footer a { color: var(--href); }
+  /* Below this width the three columns stop fitting side by side; the date and
+     size move under the name rather than being clipped. */
+  @media (max-width: 640px) {
+    th { display: none; }
+    td { display: block; border: 0; padding: 2px 10px; }
+    tr { display: block; padding: 8px 0; border-bottom: 1px solid var(--line); }
+    td.num, td.date { text-align: left; }
+    td.num::after { content: ""; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>{{.Path}}</h1>
+  <p class="meta">
+    <b>{{.Count}}</b> 个文件 · 合计 <b>{{.TotalSize}}</b>
+    {{- if .Label}} · {{.Label}}{{end}}
+    {{- if .Expires}} · <span title="到期后这个链接失效">有效至 {{.Expires}}</span>{{end}}
+  </p>
+
+  {{if .Files}}
+  <table>
+    <thead>
+      <tr><th>名称</th><th>修改时间</th><th style="text-align:right">大小</th></tr>
+    </thead>
+    <tbody>
+      {{range .Files}}
+      <tr>
+        <td class="name"><a href="{{.Href}}">{{.Name}}</a></td>
+        <td class="date">{{.Modified}}</td>
+        <td class="num">{{.Size}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table>
+  {{else}}
+  <p class="empty">
+    这个分享链接下现在没有任何文件。
+    {{- if .Hidden}}（有 {{.Hidden}} 个已经过期）{{end}}
+  </p>
+  {{end}}
+
+  {{if .Hidden}}
+  <p class="meta" style="margin-top:14px">另有 {{.Hidden}} 个文件已过期，不再列出。</p>
+  {{end}}
+
+  <footer>
+    由 <a href="/">agentshare</a> 提供 · 这个页面是机器生成的，没有脚本
+    {{- if .HasJSON}} · <a href="{{.JSONHref}}">机器可读的清单</a>{{end}}
+  </footer>
+</main>
+</body>
+</html>

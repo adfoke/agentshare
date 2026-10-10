@@ -99,7 +99,9 @@ func New(cfg *config.Config, st *store.Store, bl *blob.Store, log *slog.Logger, 
 	r.GET("/favicon.ico", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 
 	// Capability URLs: possession of the token is the credential.
-	get(r, "/s/:token", s.publicDownload)
+	get(r, "/s/:token", s.publicShare)
+	get(r, "/s/:token/", s.publicShare) // the URL a browser settles on
+	get(r, "/s/:token/f/:fileID", s.publicShareFile)
 	get(r, "/s/:token/info", s.publicShareInfo)
 
 	// --- authenticated ----------------------------------------------------

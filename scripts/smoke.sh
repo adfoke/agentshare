@@ -30,16 +30,19 @@ CURL=(curl -sS --noproxy '*' --max-time 20)
 
 WORK="$(mktemp -d)"
 file_id=""
+file_id2=""
 
 # Remove anything this run created, even if it is interrupted part-way. A test
 # that leaves a file behind in the service it was testing makes the next run
 # fail for a reason that has nothing to do with the code — which is exactly how
 # this trap came to be written.
 cleanup() {
-  if [ -n "$file_id" ]; then
-    "${CURL[@]}" -X DELETE -H "Authorization: Bearer $TOKEN" \
-      "$BASE/v1/files/$file_id" >/dev/null 2>&1 || true
-  fi
+  for id in "$file_id" "$file_id2"; do
+    if [ -n "$id" ]; then
+      "${CURL[@]}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+        "$BASE/v1/files/$id" >/dev/null 2>&1 || true
+    fi
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -136,6 +139,48 @@ if cmp -s "$WORK/payload.bin" "$WORK/shared.bin"; then ok "stranger downloads id
 eq "second download is allowed" "200" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$share_token")"
 eq "third download hits the limit" "403" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$share_token")"
 
+# --- a share covering several files: the link opens as an index page -----
+printf 'second file for the set\n' > "$WORK/second.txt"
+second=$("${CURL[@]}" -T "$WORK/second.txt" -H "Authorization: Bearer $TOKEN" \
+  -H "X-Filename: second.txt" "$BASE/v1/files")
+file_id2=$(printf '%s' "$second" | jget file.id)
+
+set_share=$("${CURL[@]}" -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"file_ids\":[\"$file_id\",\"$file_id2\"],\"label\":\"smoke set\"}" "$BASE/v1/shares")
+set_token=$(printf '%s' "$set_share" | jget share.id)
+eq "a set share reports its size" "2" "$(printf '%s' "$set_share" | jget share.file_count)"
+
+index=$("${CURL[@]}" -D "$WORK/index.h" "$BASE/s/$set_token")
+eq "the set link is an index page" "200" "$(head -1 "$WORK/index.h" | awk '{print $2}')"
+eq "the index is served as HTML" "text/html" \
+  "$(grep -i '^content-type' "$WORK/index.h" | tr -d '\r' | cut -d' ' -f2 | cut -d';' -f1)"
+eq "the index names every file" "2" "$(printf '%s' "$index" | grep -c 'payload.bin\|second.txt')"
+# The policy is a response header; the body has no script either, but the header
+# is what a browser enforces.
+eq "the index forbids scripts" "1" \
+  "$(grep -ci "default-src 'none'" "$WORK/index.h")"
+
+# Checked before any member is fetched, because the question is whether merely
+# opening the index spends the share's budget.
+set_info=$("${CURL[@]}" "$BASE/s/$set_token/info")
+eq "info lists the members" "2" "$(printf '%s' "$set_info" | jget files.1.name | wc -c | tr -d ' ' | awk '{print ($1>1)?2:0}')"
+eq "opening the index spends no download" "0" "$(printf '%s' "$set_info" | jget share.downloads)"
+
+"${CURL[@]}" -H "Authorization: Bearer $TOKEN" -o "$WORK/set-member.bin" "$BASE/s/$set_token/f/$file_id2"
+if cmp -s "$WORK/second.txt" "$WORK/set-member.bin"; then ok "a member downloads byte-identical"; else bad "a member download differs"; fi
+
+# A file that exists in the store but is not a member of this share. Taking the
+# id out of thin air rather than from another upload makes the point precisely:
+# the token, not the store's contents, is what scopes this route.
+eq "a file outside the set is not reachable through it" "404" \
+  "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$set_token/f/f_00000000000000000000")"
+
+"${CURL[@]}" -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/shares/$set_token" >/dev/null
+eq "the set link can be revoked" "404" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$set_token")"
+
+"${CURL[@]}" -X DELETE -H "Authorization: Bearer $TOKEN" "$BASE/v1/files/$file_id2" >/dev/null
+file_id2=""
+
 # --- listing --------------------------------------------------------------
 list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "$BASE/v1/files?limit=10&tag=smoke")
 eq "listing finds the upload by tag" "$file_id" "$(printf '%s' "$list" | jget files.0.id)"
@@ -160,7 +205,9 @@ eq "revoking a token takes effect" "401" \
 eq "delete removes the file" "200" "$(code DELETE "/v1/files/$file_id")"
 eq "metadata is gone" "404" "$(code GET "/v1/files/$file_id")"
 eq "bytes are gone" "404" "$(code GET "/v1/files/$file_id/content")"
-eq "the share link died with it" "404" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$share_token")"
+# The share survives its file's deletion: "this link has no files left" is a
+# more useful answer than "no such link", which would suggest a bad URL.
+eq "the share link reports its files are gone" "410" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$share_token")"
 
 # --- housekeeping ---------------------------------------------------------
 left=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "$BASE/v1/files" | jget count)

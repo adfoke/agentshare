@@ -59,34 +59,63 @@ func (s *Server) fileDTO(c *gin.Context, f *store.File) fileDTO {
 	return dto
 }
 
-type shareDTO struct {
-	ID           string   `json:"id"`
-	URL          string   `json:"url"`
-	FileID       string   `json:"file_id"`
-	Label        string   `json:"label,omitempty"`
-	Owner        string   `json:"owner,omitempty"`
-	CreatedAt    string   `json:"created_at"`
-	ExpiresAt    *string  `json:"expires_at"`
-	MaxDownloads *int64   `json:"max_downloads"`
-	Downloads    int64    `json:"downloads"`
-	File         *fileDTO `json:"file,omitempty"`
+// shareItemDTO names one file inside a share. It is deliberately thinner than a
+// full fileDTO: a share covering a few hundred files should not repeat every
+// digest and URL of each one in its own description.
+type shareItemDTO struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
+	URL  string `json:"url"`
 }
 
-func (s *Server) shareDTO(c *gin.Context, sh *store.Share, f *store.File) shareDTO {
+type shareDTO struct {
+	ID    string `json:"id"`
+	URL   string `json:"url"`
+	Label string `json:"label,omitempty"`
+	Owner string `json:"owner,omitempty"`
+	// IndexURL is where a browser sees the listing. For a share of several
+	// files it is the same as URL; it is spelled out so a client never has to
+	// know which of the two shapes it is holding.
+	IndexURL     string         `json:"index_url"`
+	FileCount    int            `json:"file_count"`
+	FileIDs      []string       `json:"file_ids,omitempty"`
+	Files        []shareItemDTO `json:"files,omitempty"`
+	CreatedAt    string         `json:"created_at"`
+	ExpiresAt    *string        `json:"expires_at"`
+	MaxDownloads *int64         `json:"max_downloads"`
+	Downloads    int64          `json:"downloads"`
+	// File is filled in only for a share of exactly one file, which is where the
+	// original single-file shape still applies and existing clients read it.
+	File *fileDTO `json:"file,omitempty"`
+}
+
+func (s *Server) shareDTO(c *gin.Context, sh *store.Share, files ...*store.File) shareDTO {
+	base := s.absURL(c, "/s/"+sh.ID)
 	dto := shareDTO{
 		ID:           sh.ID,
-		URL:          s.absURL(c, "/s/"+sh.ID),
-		FileID:       sh.FileID,
+		URL:          base,
 		Label:        sh.Label,
 		Owner:        sh.Owner,
+		IndexURL:     base + "/",
+		FileCount:    len(files),
 		CreatedAt:    timeStr(sh.CreatedAt),
 		ExpiresAt:    timePtrStr(sh.ExpiresAt),
 		MaxDownloads: sh.MaxDownloads,
 		Downloads:    sh.Downloads,
 	}
-	if f != nil {
-		fd := s.fileDTO(c, f)
-		fd.URLs.Public = dto.URL
+	for _, f := range files {
+		dto.FileIDs = append(dto.FileIDs, f.ID)
+		dto.Files = append(dto.Files, shareItemDTO{
+			ID:   f.ID,
+			Name: f.Name,
+			Size: f.Size,
+			URL:  base + "/f/" + f.ID,
+		})
+	}
+	if len(files) == 1 {
+		fd := s.fileDTO(c, files[0])
+		fd.URLs.Public = base
 		dto.File = &fd
 	}
 	return dto
