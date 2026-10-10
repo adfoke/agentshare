@@ -305,12 +305,23 @@ func (s *Store) ListFiles(ctx context.Context, f ListFilter) ([]*File, string, e
 
 // DeleteResult reports what removing a file did to the underlying blob.
 type DeleteResult struct {
-	File      *File
-	BlobFreed bool
+	File *File
+	// References is how many file records still point at the same content once
+	// this one is gone. Zero means the bytes are now unreachable and eligible
+	// for reclamation — but reclamation itself is not this call's job: see the
+	// note on Store.DeleteFile.
+	References int64
 }
 
-// DeleteFile removes a record and tells the caller whether its content became
-// unreferenced (and may therefore be deleted from the blob store).
+// DeleteFile removes a record and reports how many others still reference its
+// content.
+//
+// It deliberately does not delete the blob. Deciding that a blob is unreferenced
+// and then acting on that decision cannot be made atomic here: an upload of the
+// same bytes can commit its blob and insert its row in the gap, at which point
+// the deletion takes out content that a live record points at. The blob store's
+// sweep decides this from a snapshot instead, which is the only place the
+// question can be answered safely.
 func (s *Store) DeleteFile(ctx context.Context, id string) (DeleteResult, error) {
 	var res DeleteResult
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
@@ -321,13 +332,13 @@ func (s *Store) DeleteFile(ctx context.Context, id string) (DeleteResult, error)
 		if _, err := tx.ExecContext(ctx, `DELETE FROM files WHERE id = ?`, id); err != nil {
 			return err
 		}
-		var refs int
+		var refs int64
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM files WHERE sha256 = ?`, f.Sha256).Scan(&refs); err != nil {
 			return err
 		}
 		res.File = f
-		res.BlobFreed = refs == 0
+		res.References = refs
 		return nil
 	})
 	return res, err

@@ -72,10 +72,16 @@ func run() error {
 		return err
 	}
 	if generated {
+		// The token itself is deliberately not logged. This line goes to stdout
+		// and, under systemd, into the journal — both of which outlive the
+		// install, survive being shipped to a log collector, and are readable by
+		// anything with journal access. A root credential in a log is a
+		// credential leaked, so the operator is told where to read it instead.
+		// The file is written 0600 for exactly this reason.
 		log.Warn("generated a root token; it is saved in the data directory",
 			"path", filepath.Join(absData, "admin.token"),
-			"token", adminToken,
-			"next", "put it in AGENTSHARE_ADMIN_TOKEN for the service, or mint scoped tokens with POST /v1/tokens")
+			"next", "read it from that file, put it in AGENTSHARE_ADMIN_TOKEN for the "+
+				"service, or mint scoped tokens with POST /v1/tokens")
 	}
 	if len(adminToken) < 16 {
 		log.Warn("the configured root token is short; use at least 32 random characters",
@@ -189,6 +195,17 @@ func resolveAdminToken(cfg *config.Config, log *slog.Logger) (token string, gene
 	return token, true, nil
 }
 
+// blobGCGrace is how long a blob is left alone after it was written.
+//
+// Committing a blob and recording the row that references it happen
+// microseconds apart, and the reclaim decides what to delete from a snapshot
+// taken before that pair completes. Anything written since the snapshot could
+// be in that gap, so it is left alone. Minutes rather than milliseconds because
+// the two ways of being wrong are not symmetric: touching a blob too early
+// loses an upload for good, while waiting too long only delays reclaiming a
+// deleted file.
+const blobGCGrace = 5 * time.Minute
+
 // runJanitor deletes what has expired and reclaims the disk behind it.
 //
 // The blob sweep is a full pass over the store rather than a reference count:
@@ -198,29 +215,37 @@ func runJanitor(ctx context.Context, st *store.Store, blobs *blob.Store, every t
 	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 
-	sweep := func(first bool) {
+	sweep := func() {
 		now := time.Now()
 		res, err := st.SweepExpired(ctx, now)
 		if err != nil {
 			log.Error("janitor: sweep failed", "err", err.Error())
 			return
 		}
-		if first || res.Files > 0 {
-			refs, err := st.AllDigests(ctx)
+
+		// Reclaim every pass, not only when something expired. Unreferenced
+		// blobs no longer appear as a side effect of expiry — deleting a file
+		// through the API does not remove its bytes, precisely so the decision
+		// can be made safely here — so a conditional reclaim would let every
+		// ordinary deletion leak its content until the next thing happened to
+		// expire.
+		snapshotAt := time.Now()
+		refs, err := st.AllDigests(ctx)
+		if err != nil {
+			log.Error("janitor: cannot read referenced digests", "err", err.Error())
+		} else {
+			gc, err := blobs.GC(func(sum string) bool {
+				_, ok := refs[sum]
+				return ok
+			}, snapshotAt.Add(-blobGCGrace))
 			if err != nil {
-				log.Error("janitor: cannot read referenced digests", "err", err.Error())
-			} else {
-				removed, freed, err := blobs.GC(func(sum string) bool {
-					_, ok := refs[sum]
-					return ok
-				})
-				if err != nil {
-					log.Error("janitor: blob collection failed", "err", err.Error())
-				} else if removed > 0 {
-					log.Info("janitor: reclaimed blobs", "removed", removed, "bytes_freed", freed)
-				}
+				log.Error("janitor: blob collection failed", "err", err.Error())
+			} else if gc.Removed > 0 {
+				log.Info("janitor: reclaimed blobs",
+					"removed", gc.Removed, "bytes_freed", gc.Freed, "too_recent_to_touch", gc.Skipped)
 			}
 		}
+
 		if n, err := blobs.CleanTemp(now.Add(-time.Hour)); err != nil {
 			log.Error("janitor: temp cleanup failed", "err", err.Error())
 		} else if n > 0 {
@@ -232,13 +257,13 @@ func runJanitor(ctx context.Context, st *store.Store, blobs *blob.Store, every t
 		}
 	}
 
-	sweep(true)
+	sweep()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweep(false)
+			sweep()
 		}
 	}
 }

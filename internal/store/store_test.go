@@ -47,10 +47,11 @@ func TestFileLifecycle(t *testing.T) {
 	}
 }
 
-// Two records can share one blob. Deleting either must not free the bytes until
-// the last reference is gone — that is the whole reason blobs and records are
-// separate tables.
-func TestDeleteFreesBlobOnlyWhenUnreferenced(t *testing.T) {
+// Two records can share one content. Deleting either must report that the bytes
+// are still referenced until the last one goes — that is the whole reason blobs
+// and records are separate tables. Acting on the count is not this call's job;
+// it only reports it, for the reasons on DeleteFile.
+func TestDeleteReportsRemainingReferences(t *testing.T) {
 	ctx := context.Background()
 	s := newStore(t)
 
@@ -65,16 +66,16 @@ func TestDeleteFreesBlobOnlyWhenUnreferenced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.BlobFreed {
-		t.Fatal("blob is still referenced by f_2 and must not be freed")
+	if res.References != 1 {
+		t.Fatalf("References = %d after deleting one of two records, want 1", res.References)
 	}
 
 	res, err = s.DeleteFile(ctx, "f_2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !res.BlobFreed {
-		t.Fatal("last reference removed, blob should be freed")
+	if res.References != 0 {
+		t.Fatalf("References = %d after the last record went, want 0", res.References)
 	}
 	if _, err := s.DeleteFile(ctx, "f_2"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)

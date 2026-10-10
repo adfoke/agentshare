@@ -129,6 +129,16 @@ func digestHex(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// blobCount is how many distinct blobs the store holds right now.
+func (e *testEnv) blobCount() int {
+	e.t.Helper()
+	n := 0
+	if err := e.blobs.Walk(func(string, int64, time.Time) error { n++; return nil }); err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
 // upload is the common case: raw body, a name, and the reply decoded.
 func (e *testEnv) upload(content []byte, name string, extra ...reqOpt) (int, map[string]any) {
 	e.t.Helper()
@@ -602,12 +612,8 @@ func TestUploadIsIdempotentAndContentAddressed(t *testing.T) {
 		t.Fatalf("digest changed: %v", got)
 	}
 	// One blob on disk, two records pointing at it.
-	count := 0
-	if err := e.blobs.Walk(func(string, int64) error { count++; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if count != 1 {
-		t.Fatalf("blob store holds %d blobs, want 1", count)
+	if n := e.blobCount(); n != 1 {
+		t.Fatalf("blob store holds %d blobs, want 1", n)
 	}
 }
 
@@ -623,10 +629,8 @@ func TestUploadRejectsBadChecksum(t *testing.T) {
 		t.Fatalf("code = %s, want %s", code, codeChecksum)
 	}
 	// The rejected bytes must not have been stored.
-	count := 0
-	_ = e.blobs.Walk(func(string, int64) error { count++; return nil })
-	if count != 0 {
-		t.Fatalf("%d blobs were stored despite the checksum failure", count)
+	if n := e.blobCount(); n != 0 {
+		t.Fatalf("%d blobs were stored despite the checksum failure", n)
 	}
 }
 
@@ -817,7 +821,19 @@ func TestDeleteFile(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("delete = %d", resp.StatusCode)
 	}
-	resp.Body.Close()
+	var del struct {
+		Deleted             bool  `json:"deleted"`
+		ReferencesRemaining int64 `json:"references_remaining"`
+		BlobReclaimed       bool  `json:"blob_reclaimed"`
+	}
+	decode(t, resp, &del)
+	if !del.Deleted {
+		t.Fatal("delete did not report success")
+	}
+	if del.ReferencesRemaining != 0 {
+		t.Fatalf("references_remaining = %d after deleting the only record, want 0",
+			del.ReferencesRemaining)
+	}
 
 	resp = e.do(http.MethodGet, "/v1/files/"+id, nil)
 	if resp.StatusCode != http.StatusNotFound {
@@ -831,14 +847,96 @@ func TestDeleteFile(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	// The bytes are gone from disk too, not merely unlinked from the metadata.
+	// The bytes are still on disk, and that is the point: deciding here that
+	// the content is unreferenced and deleting it takes two steps that a
+	// concurrent upload of the same bytes can land between, which would destroy
+	// an upload that is still referenced. The sweep answers the same question
+	// from a snapshot, so it does the deleting.
+	if !e.blobs.Exists(digestHex(content)) {
+		t.Fatal("the delete request removed the content itself; a concurrent " +
+			"re-upload of the same bytes could have lost its file")
+	}
+	if del.BlobReclaimed {
+		t.Error("the response claims reclamation, but reclamation is the sweep's job")
+	}
+
+	// The sweep reclaims it, because nothing references those bytes any more.
+	res, err := e.blobs.GC(func(string) bool { return false }, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed != 1 {
+		t.Fatalf("the sweep removed %d blobs, want the one now unreferenced", res.Removed)
+	}
 	if e.blobs.Exists(digestHex(content)) {
-		t.Fatal("blob still on disk after deleting its only reference")
+		t.Fatal("the content survived the sweep that should have reclaimed it")
 	}
 
 	resp = e.do(http.MethodDelete, "/v1/files/"+id, nil)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("double delete = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// A body limit has to be enforced while reading. A check placed after the
+// decoder returns is a check on something that has already happened, and the
+// allocation is the attack: the least privileged credential the service issues
+// should not be able to make the process buffer as much as it likes.
+func TestJSONEndpointsBoundTheirBodies(t *testing.T) {
+	e := newTestEnv(t, nil)
+
+	// The body has to be valid JSON up to the point where it runs past the
+	// limit. A body that is malformed instead fails as a syntax error first,
+	// which is a 400 and proves nothing about the size bound.
+	oversizedJSON := func(field string, size int) []byte {
+		body := []byte(`{"` + field + `":"`)
+		for len(body) < size {
+			body = append(body, 'x')
+		}
+		return append(body, '"', '}')
+	}
+
+	// 256 KiB is far past anything these endpoints legitimately receive, and
+	// well past the 64 KiB they are allowed.
+	for _, tc := range []struct{ path, field string }{
+		{"/v1/shares", "file_id"},
+		{"/v1/tokens", "scopes"},
+	} {
+		body := oversizedJSON(tc.field, 256<<10)
+		resp := e.do(http.MethodPost, tc.path, body,
+			withHeader("Content-Type", "application/json"))
+		if resp.StatusCode != http.StatusRequestEntityTooLarge {
+			t.Errorf("POST %s with a %d byte body = %d, want 413",
+				tc.path, len(body), resp.StatusCode)
+			resp.Body.Close()
+			continue
+		}
+		if code := failCode(t, resp); code != codeTooLarge {
+			t.Errorf("POST %s error code = %s, want %s", tc.path, code, codeTooLarge)
+		}
+	}
+
+	// /v1/text carries content, so it gets a larger allowance — but it is still
+	// bounded, and a body past the bound is refused while it is being read.
+	huge := oversizedJSON("content", 13<<20)
+	resp := e.do(http.MethodPost, "/v1/text", huge,
+		withHeader("Content-Type", "application/json"))
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("POST /v1/text with a %d byte body = %d, want 413", len(huge), resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// A body that fits is still accepted, so the limit is not simply refusing
+	// everything.
+	if status, _ := e.upload([]byte("small"), "small.txt"); status != http.StatusCreated {
+		t.Fatalf("an ordinary small upload = %d, want 201", status)
+	}
+	resp = e.do(http.MethodPost, "/v1/shares", mustJSON(t, map[string]any{"file_id": "f_nope"}),
+		withHeader("Content-Type", "application/json"))
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("a well-formed small body = %d, want 404 (unknown file), not a size error",
+			resp.StatusCode)
 	}
 	resp.Body.Close()
 }

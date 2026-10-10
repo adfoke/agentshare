@@ -23,10 +23,9 @@ type createTokenRequest struct {
 }
 
 func (s *Server) createToken(c *gin.Context) {
-	var req createTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, codeBadRequest, "invalid JSON body: "+err.Error(),
-			`expected {"name": "nightly-ci", "scopes": ["upload","share"], "ttl": "30d"}`)
+	req, ok := bindJSON[createTokenRequest](c, maxSmallBody,
+		`expected {"name": "nightly-ci", "scopes": ["upload","share"], "ttl": "30d"}`)
+	if !ok {
 		return
 	}
 

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -116,15 +117,110 @@ func TestGC(t *testing.T) {
 	keep, _ := write(t, s, []byte("keep me"))
 	drop, _ := write(t, s, []byte("drop me"))
 
-	removed, freed, err := s.GC(func(sum string) bool { return sum == keep })
+	// A zero cutoff means no grace period, which is what a test or a forced
+	// sweep on a quiet store wants.
+	res, err := s.GC(func(sum string) bool { return sum == keep }, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 1 || freed != int64(len("drop me")) {
-		t.Fatalf("GC removed=%d freed=%d, want 1 and %d", removed, freed, len("drop me"))
+	if res.Removed != 1 || res.Freed != int64(len("drop me")) || res.Skipped != 0 {
+		t.Fatalf("GC = %+v, want 1 removed, %d freed, 0 skipped", res, len("drop me"))
 	}
 	if !s.Exists(keep) || s.Exists(drop) {
 		t.Fatal("GC kept the wrong blobs")
+	}
+}
+
+// The sweep decides from a snapshot of the referenced digests that it read
+// before walking. A blob committed after that snapshot is absent from it while
+// being very much referenced — its metadata row exists — so reclaiming it would
+// strand the record and lose the upload permanently. The age test is what makes
+// that safe, and this is the test that keeps it there.
+func TestGCLeavesRecentlyWrittenBlobsAlone(t *testing.T) {
+	s := newStore(t)
+
+	oldSum, _ := write(t, s, []byte("written long ago"))
+	recentSum, _ := write(t, s, []byte("written just now"))
+
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(s.Path(oldSum), past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.GC(func(string) bool { return false }, time.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed != 1 || res.Skipped != 1 {
+		t.Fatalf("GC = %+v, want 1 removed and 1 skipped", res)
+	}
+	if s.Exists(oldSum) {
+		t.Error("an unreferenced blob older than the cutoff should have been reclaimed")
+	}
+	if !s.Exists(recentSum) {
+		t.Error("a blob written after the cutoff was reclaimed; " +
+			"a concurrent upload of that content could have lost it")
+	}
+
+	// With no grace period the same sweep takes it, which is what makes the
+	// skipped count above meaningful rather than incidental.
+	res, err = s.GC(func(string) bool { return false }, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed != 1 || res.Skipped != 0 {
+		t.Fatalf("no-grace GC = %+v, want 1 removed and 0 skipped", res)
+	}
+	if s.Exists(recentSum) {
+		t.Error("the recent blob survived a sweep that was told not to spare it")
+	}
+}
+
+// Path is the only place in this program where a string becomes a filesystem
+// path, which makes it the last line of defence against a traversal. Nothing
+// that is not a digest names a blob.
+func TestNothingButADigestNamesABlob(t *testing.T) {
+	s := newStore(t)
+
+	for _, bad := range []string{
+		"",
+		"..",
+		"../../etc/passwd",
+		"../../../root/.ssh/authorized_keys",
+		"/etc/passwd",
+		"ab/cd",
+		"abcdef",                      // too short
+		strings.Repeat("a", 65),       // too long
+		strings.Repeat("g", 64),       // not hex
+		strings.Repeat("a", 63) + "/", // right length, wrong alphabet
+		"./../blobs",
+	} {
+		if got := s.Path(bad); got != "" {
+			t.Errorf("Path(%q) = %q, want empty: a traversal must not be addressable", bad, got)
+		}
+		if _, err := s.Open(bad); err != ErrNotFound {
+			t.Errorf("Open(%q) = %v, want ErrNotFound", bad, err)
+		}
+		if _, err := s.Stat(bad); err != ErrNotFound {
+			t.Errorf("Stat(%q) = %v, want ErrNotFound", bad, err)
+		}
+		if s.Exists(bad) {
+			t.Errorf("Exists(%q) = true", bad)
+		}
+		if err := s.Remove(bad); err != ErrNotFound {
+			t.Errorf("Remove(%q) = %v, want ErrNotFound", bad, err)
+		}
+		if _, err := s.Commit("/nonexistent", bad); err == nil {
+			t.Errorf("Commit(%q) accepted a non-digest", bad)
+		}
+	}
+
+	// An uppercase digest is the same digest, not a different one: it is
+	// normalised before it is validated, and still names a real path.
+	upper := strings.ToUpper(strings.Repeat("ab", 32))
+	got := s.Path(upper)
+	if got == "" || !strings.HasSuffix(got, strings.Repeat("ab", 32)) {
+		t.Errorf("Path(upper digest) = %q, want the lowercased blob path", got)
 	}
 }
 

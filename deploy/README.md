@@ -55,18 +55,39 @@ ASH_DEFAULT_TTL=30d \
 
 ## 二、代理地址（Cloudflare 橙云）
 
-需要四个文件（两个 snippet、一个 vhost、一个生成脚本）：
+需要五个文件（三个 snippet、一个 vhost、一个生成脚本）：
 
 ```bash
 install -d -m 0755 /etc/nginx/snippets /var/www/certbot
 install -m 0644 nginx/agentshare-proxy.conf   /etc/nginx/snippets/agentshare-proxy.conf
 install -m 0644 nginx/acme-challenge.conf     /etc/nginx/snippets/acme-challenge.conf
 install -m 0644 nginx/cloudflare-guard.conf   /etc/nginx/snippets/cloudflare-guard.conf
+
+# 必须早于引用它的 vhost：里面的 log_format 要在 sites-enabled 被解析之前存在
+install -m 0644 nginx/hardening.conf          /etc/nginx/conf.d/00-agentshare-hardening.conf
+# 版本号：改这一条，不是加一条（加了会报 duplicate directive）
+sed -i 's/^\tserver_tokens build;.*/\tserver_tokens off;/' /etc/nginx/nginx.conf
+
 install -m 0644 nginx/tempsnap.cc.conf        /etc/nginx/sites-available/<你的域名>.conf   # 改成自己的 server_name
 bash nginx/update-cloudflare-ips.sh           # 生成 realip + geo 两个 conf.d 文件
 ln -sf /etc/nginx/sites-available/<域名>.conf /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
 ```
+
+`hardening.conf` 做三件事：关掉版本号（改 nginx.conf 那一行）、给所有 vhost 发 HSTS、
+以及让 access log **不再记录 `/s/<token>` 的明文**。三个都是"源站这一层自己该管、
+反代不会替你做"的事。
+
+⚠️ **为什么分享 token 不该进日志**：分享链接是**能力凭据** —— 谁拿到 token 谁就能下载，
+不需要任何别的凭据。把它写进 access log，等于让每一个**后来**能读到日志的人
+（日志收集器、备份、某次排障会话）都成为服务历史上发过的**每一条链接**的持有者。
+agentshare 自己的访问日志早就把它脱敏成 `/s/<redacted>`，nginx 这一层现在做同一件事。
+
+⚠️ **改 nginx 配置的手法**：先备份 → 装文件 → `nginx -t` → **验过了才 `reload`**。
+nginx 在 reload 成功之前一直用内存里的旧配置服务，所以这个顺序本身是安全的 ——
+但**备份必须按目录分开**：如果 vhost 和 conf.d 的备份混在同一个目录，
+还原时 `cp 备份/* /etc/nginx/conf.d/` 会把 vhost 一起拷进 conf.d，
+变成「http 上下文里出现 server 块」的另一个错（这个我踩过，靠 `nginx -t` 挡住了）。
 
 ### 为什么是这几条
 

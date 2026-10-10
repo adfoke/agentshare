@@ -23,6 +23,31 @@ import (
 // ErrNotFound is returned when a digest has no blob on disk.
 var ErrNotFound = errors.New("blob not found")
 
+// digestLen is the only shape a blob's name ever takes.
+const digestLen = 64
+
+// validDigest reports whether sum names a blob: 64 lowercase hex characters.
+//
+// This is checked on the way in rather than trusted from the caller because
+// Path is the one place in this program where a string becomes a filesystem
+// path. Today every caller validates first — the digest routes check the hex at
+// the edge, and everything else comes out of the database — but a store whose
+// job is "map a string to a file" should not be the component that turns a
+// "../../.." into a path traversal because a future caller forgot.
+func validDigest(sum string) bool {
+	if len(sum) != digestLen {
+		return false
+	}
+	for i := 0; i < len(sum); i++ {
+		switch c := sum[i]; {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // Store owns <root>/blobs and <root>/tmp.
 type Store struct {
 	root string
@@ -52,11 +77,16 @@ func (s *Store) Temp() (*os.File, error) {
 	return os.CreateTemp(s.tmp, "up-*")
 }
 
-// Path returns the on-disk path of a digest. It does not touch the filesystem.
+// Path returns the on-disk path of a digest, or "" if sum does not name a
+// blob. It does not touch the filesystem.
+//
+// The empty return is deliberate: there is no path that could be confused for
+// a real blob, so a caller that ignores the check cannot accidentally be handed
+// a traversable path. Every accessor below tests for it.
 func (s *Store) Path(sum string) string {
 	sum = normalize(sum)
-	if len(sum) < 4 {
-		return filepath.Join(s.root, sum)
+	if !validDigest(sum) {
+		return ""
 	}
 	return filepath.Join(s.root, sum[0:2], sum[2:4], sum)
 }
@@ -70,7 +100,7 @@ func normalize(sum string) string { return strings.ToLower(strings.TrimSpace(sum
 // readers never observe a partially written blob.
 func (s *Store) Commit(tmpPath, sum string) (existed bool, err error) {
 	sum = normalize(sum)
-	if len(sum) != 64 {
+	if !validDigest(sum) {
 		return false, fmt.Errorf("invalid sha256 %q", sum)
 	}
 	final := s.Path(sum)
@@ -106,7 +136,11 @@ func (s *Store) Commit(tmpPath, sum string) (existed bool, err error) {
 
 // Open returns the blob for reading. The caller closes it.
 func (s *Store) Open(sum string) (*os.File, error) {
-	f, err := os.Open(s.Path(sum))
+	path := s.Path(sum)
+	if path == "" {
+		return nil, ErrNotFound
+	}
+	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNotFound
 	}
@@ -115,7 +149,11 @@ func (s *Store) Open(sum string) (*os.File, error) {
 
 // Stat reports a blob's size.
 func (s *Store) Stat(sum string) (int64, error) {
-	fi, err := os.Stat(s.Path(sum))
+	path := s.Path(sum)
+	if path == "" {
+		return 0, ErrNotFound
+	}
+	fi, err := os.Stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, ErrNotFound
 	}
@@ -127,21 +165,31 @@ func (s *Store) Stat(sum string) (int64, error) {
 
 // Exists reports whether the digest is stored.
 func (s *Store) Exists(sum string) bool {
-	fi, err := os.Stat(s.Path(sum))
+	path := s.Path(sum)
+	if path == "" {
+		return false
+	}
+	fi, err := os.Stat(path)
 	return err == nil && fi.Mode().IsRegular()
 }
 
 // Remove deletes one blob. A missing blob is not an error.
 func (s *Store) Remove(sum string) error {
-	err := os.Remove(s.Path(sum))
+	path := s.Path(sum)
+	if path == "" {
+		return ErrNotFound
+	}
+	err := os.Remove(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	return err
 }
 
-// Walk visits every stored blob. mk is called with the digest of each entry.
-func (s *Store) Walk(fn func(sum string, size int64) error) error {
+// Walk visits every stored blob, reporting each one's digest, size and
+// modification time. The modification time is what GC uses to leave recent
+// writes alone; see GC.
+func (s *Store) Walk(fn func(sum string, size int64, mod time.Time) error) error {
 	return filepath.WalkDir(s.root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -151,33 +199,62 @@ func (s *Store) Walk(fn func(sum string, size int64) error) error {
 		}
 		// <root>/ab/cd/<digest>
 		sum := filepath.Base(path)
-		if len(sum) != 64 {
+		if !validDigest(sum) {
 			return nil
 		}
 		fi, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		return fn(sum, fi.Size())
+		return fn(sum, fi.Size(), fi.ModTime())
 	})
 }
 
-// GC removes every blob for which referenced returns false. It is deliberately
-// a full sweep rather than reference counting: it also cleans up blobs left
-// behind by a crash, and it runs rarely enough that the cost does not matter.
-func (s *Store) GC(referenced func(sum string) bool) (removed int, freed int64, err error) {
-	err = s.Walk(func(sum string, size int64) error {
+// GCResult reports what a sweep did, including what it deliberately left alone.
+type GCResult struct {
+	Removed int
+	Freed   int64
+	// Skipped counts blobs that are unreferenced but were written too recently
+	// to touch. A non-zero value here is normal and healthy: it means uploads
+	// were in flight while the sweep ran.
+	Skipped int
+}
+
+// GC removes every blob that is unreferenced and older than untouchedSince.
+//
+// It is deliberately a full sweep rather than reference counting: it also
+// cleans up blobs left behind by a crash, and it runs rarely enough that the
+// cost does not matter.
+//
+// The age test is what makes the sweep safe. Callers pass a snapshot of the
+// referenced digests taken *before* the walk, so a blob committed after that
+// snapshot is missing from it while being very much referenced — deleting it
+// would strand its metadata row and lose the upload for good. Committing a blob
+// and inserting its row happen microseconds apart, so refusing to touch
+// anything written in the last few minutes removes the race entirely, at the
+// cost of reclaiming recent deletions a little later than it otherwise would.
+//
+// A zero untouchedSince means "no grace period": delete everything
+// unreferenced. That is right for a test and for an operator forcing a sweep on
+// a quiet store; it is not what the janitor passes.
+func (s *Store) GC(referenced func(sum string) bool, untouchedSince time.Time) (GCResult, error) {
+	var res GCResult
+	err := s.Walk(func(sum string, size int64, mod time.Time) error {
 		if referenced(sum) {
+			return nil
+		}
+		if !untouchedSince.IsZero() && mod.After(untouchedSince) {
+			res.Skipped++
 			return nil
 		}
 		if rmErr := s.Remove(sum); rmErr != nil {
 			return rmErr
 		}
-		removed++
-		freed += size
+		res.Removed++
+		res.Freed += size
 		return nil
 	})
-	return removed, freed, err
+	return res, err
 }
 
 // CleanTemp removes staging files left over by an interrupted upload.
@@ -203,7 +280,7 @@ func (s *Store) CleanTemp(olderThan time.Time) (removed int, err error) {
 // TotalBytes reports how much disk the blob store occupies.
 func (s *Store) TotalBytes() (int64, error) {
 	var total int64
-	err := s.Walk(func(_ string, size int64) error {
+	err := s.Walk(func(_ string, size int64, _ time.Time) error {
 		total += size
 		return nil
 	})

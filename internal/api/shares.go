@@ -26,10 +26,9 @@ type createShareRequest struct {
 }
 
 func (s *Server) createShare(c *gin.Context) {
-	var req createShareRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, codeBadRequest, "invalid JSON body: "+err.Error(),
-			`expected {"file_id": "f_...", "ttl": "7d", "max_downloads": 3}`)
+	req, ok := bindJSON[createShareRequest](c, maxSmallBody,
+		`expected {"file_id": "f_...", "ttl": "7d", "max_downloads": 3}`)
+	if !ok {
 		return
 	}
 	fileID := strings.TrimSpace(req.FileID)

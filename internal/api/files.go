@@ -251,19 +251,20 @@ func (s *Server) finishUpload(c *gin.Context, f *store.File, deduped, blobExiste
 	})
 }
 
+type textUploadRequest struct {
+	Name        string   `json:"name"`
+	Content     string   `json:"content"`
+	Tags        []string `json:"tags"`
+	TTLSeconds  *int64   `json:"ttl_seconds"`
+	ContentType string   `json:"content_type"`
+}
+
 // uploadText stores a short UTF-8 string without making the caller build a
 // request body. Handy for logs, snippets and one-line reports.
 func (s *Server) uploadText(c *gin.Context) {
-	var req struct {
-		Name        string   `json:"name"`
-		Content     string   `json:"content"`
-		Tags        []string `json:"tags"`
-		TTLSeconds  *int64   `json:"ttl_seconds"`
-		ContentType string   `json:"content_type"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		fail(c, http.StatusBadRequest, codeBadRequest, "invalid JSON body: "+err.Error(),
-			`expected {"name": "...", "content": "..."}`)
+	req, ok := bindJSON[textUploadRequest](c, maxTextBody,
+		`expected {"name": "...", "content": "..."}`)
+	if !ok {
 		return
 	}
 	if req.Content == "" {
@@ -598,21 +599,19 @@ func (s *Server) deleteFile(c *gin.Context) {
 		return
 	}
 
-	deleted := true
-	if res.BlobFreed {
-		if err := s.blobs.Remove(res.File.Sha256); err != nil {
-			// The record is gone either way; say so, and let the janitor pick
-			// the bytes up later rather than failing the request.
-			s.log.Warn("cannot remove blob", "err", err.Error(), "sha256", res.File.Sha256)
-			deleted = false
-		}
-	}
+	// The bytes are not removed here on purpose. See Store.DeleteFile: deciding
+	// that content is unreferenced and then deleting it is not something this
+	// call can do atomically, and getting it wrong costs an upload that is still
+	// referenced. The sweep answers the same question from a snapshot, which it
+	// can do safely, so reclamation happens there.
 	c.JSON(http.StatusOK, gin.H{
-		"deleted":     true,
-		"file_id":     res.File.ID,
-		"sha256":      res.File.Sha256,
-		"blob_freed":  res.BlobFreed && deleted,
-		"share_links": "any share links for this file were revoked with it",
+		"deleted":              true,
+		"file_id":              res.File.ID,
+		"sha256":               res.File.Sha256,
+		"references_remaining": res.References,
+		"blob_reclaimed":       false,
+		"note": "the content is reclaimed by the sweep that runs on the janitor " +
+			"interval once nothing references it; this file's share links were revoked with it",
 	})
 }
 

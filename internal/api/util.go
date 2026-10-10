@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
@@ -12,6 +13,44 @@ import (
 
 	"github.com/adfoke/agentshare/internal/config"
 )
+
+// Bounds for JSON request bodies. Without one, a decoder reads the entire body
+// into memory before any handler gets a chance to object to its size.
+const (
+	// maxTextBody covers POST /v1/text: at most 8 MiB of content, plus room for
+	// JSON escaping and the surrounding fields.
+	maxTextBody = 12 << 20
+	// maxSmallBody covers the endpoints whose whole body is a handful of
+	// fields. Nothing legitimate comes close.
+	maxSmallBody = 64 << 10
+)
+
+// bindJSON decodes a JSON request body, refusing anything larger than maxBytes.
+//
+// The limit has to go on the reader rather than on the decoded value. A size
+// check placed after the call is checking something that has already happened:
+// by the time a decoder returns, it has read the whole body into memory. The
+// endpoints this guards are all behind a token, but the cheapest credential the
+// service issues should not be able to make the process allocate as much as it
+// cares to send.
+func bindJSON[T any](c *gin.Context, maxBytes int64, hint string) (*T, bool) {
+	if maxBytes > 0 {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxBytes)
+	}
+	var v T
+	if err := c.ShouldBindJSON(&v); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			fail(c, http.StatusRequestEntityTooLarge, codeTooLarge,
+				fmt.Sprintf("request body exceeds the %d byte limit for this endpoint", tooLarge.Limit),
+				hint)
+			return nil, false
+		}
+		fail(c, http.StatusBadRequest, codeBadRequest, "invalid JSON body: "+err.Error(), hint)
+		return nil, false
+	}
+	return &v, true
+}
 
 const ctxRequestID = "agentshare.request_id"
 
