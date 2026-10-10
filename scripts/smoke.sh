@@ -29,7 +29,20 @@ export NO_PROXY="${NO_PROXY:-},127.0.0.1,localhost"
 CURL=(curl -sS --noproxy '*' --max-time 20)
 
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+file_id=""
+
+# Remove anything this run created, even if it is interrupted part-way. A test
+# that leaves a file behind in the service it was testing makes the next run
+# fail for a reason that has nothing to do with the code — which is exactly how
+# this trap came to be written.
+cleanup() {
+  if [ -n "$file_id" ]; then
+    "${CURL[@]}" -X DELETE -H "Authorization: Bearer $TOKEN" \
+      "$BASE/v1/files/$file_id" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
 
 pass=0
 fail=0
