@@ -182,9 +182,11 @@ eq "the set link can be revoked" "404" "$("${CURL[@]}" -o /dev/null -w '%{http_c
 file_id2=""
 
 # --- listing --------------------------------------------------------------
-list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "$BASE/v1/files?limit=10&tag=smoke")
+# Scoped to this run's own file: the service may hold anything else, and a
+# global count would make the check depend on what happened to be there.
+list=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "$BASE/v1/files?limit=10&tag=smoke&q=$file_id")
 eq "listing finds the upload by tag" "$file_id" "$(printf '%s' "$list" | jget files.0.id)"
-eq "listing reports a count" "1" "$(printf '%s' "$list" | jget count)"
+eq "listing returns just that one" "1" "$(printf '%s' "$list" | jget count)"
 
 # --- scoped tokens --------------------------------------------------------
 tok=$("${CURL[@]}" -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
@@ -210,8 +212,11 @@ eq "bytes are gone" "404" "$(code GET "/v1/files/$file_id/content")"
 eq "the share link reports its files are gone" "410" "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$BASE/s/$share_token")"
 
 # --- housekeeping ---------------------------------------------------------
-left=$("${CURL[@]}" -H "Authorization: Bearer $TOKEN" "$BASE/v1/files" | jget count)
-eq "nothing is left behind" "0" "$left"
+# Asks about the file this run created rather than about the store as a whole:
+# a live service has whatever its users put there, and that is not this test's
+# business.
+eq "nothing this run created is left behind" "404" "$(code GET "/v1/files/$file_id")"
+eq "nor the second file" "404" "$(code GET "/v1/files/$file_id2")"
 
 echo
 if [ "$fail" -eq 0 ]; then

@@ -92,13 +92,24 @@ type shareDTO struct {
 
 func (s *Server) shareDTO(c *gin.Context, sh *store.Share, files ...*store.File) shareDTO {
 	base := s.absURL(c, "/s/"+sh.ID)
+
+	// A share always knows how many files it covers, but the members are only
+	// passed in by the calls that had reason to load them. Listing many shares
+	// should not drag every member of each one along, so the count has to come
+	// from the share when the slice is empty — otherwise the listing reports
+	// that every share covers nothing.
+	count := len(files)
+	if count == 0 {
+		count = sh.ItemCount
+	}
+
 	dto := shareDTO{
 		ID:           sh.ID,
 		URL:          base,
 		Label:        sh.Label,
 		Owner:        sh.Owner,
 		IndexURL:     base + "/",
-		FileCount:    len(files),
+		FileCount:    count,
 		CreatedAt:    timeStr(sh.CreatedAt),
 		ExpiresAt:    timePtrStr(sh.ExpiresAt),
 		MaxDownloads: sh.MaxDownloads,

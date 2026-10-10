@@ -1450,6 +1450,95 @@ func TestOpeningTheIndexDoesNotSpendADownload(t *testing.T) {
 	resp.Body.Close()
 }
 
+// Listing shares has to report how many files each covers. It does not load
+// the members — a listing of a hundred shares should not drag along every
+// member of each — so it depends on the count stored with the share. Getting
+// this wrong is invisible from a test that only ever creates and immediately
+// reads back one share: the bug is in the *list* path, which reported zero
+// files for every share until it was run against a service that was not empty.
+func TestListingSharesReportsHowManyFilesEachCovers(t *testing.T) {
+	e := newTestEnv(t, nil)
+	_, one := e.upload([]byte("one"), "one.txt")
+	oneID := fileOf(t, one)["id"].(string)
+
+	var ids []string
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		_, up := e.upload([]byte(name), name)
+		ids = append(ids, fileOf(t, up)["id"].(string))
+	}
+
+	type created struct {
+		Share struct {
+			ID        string `json:"id"`
+			FileCount int    `json:"file_count"`
+		} `json:"share"`
+	}
+	made := map[string]created{}
+	for _, body := range []map[string]any{
+		{"file_id": oneID, "label": "solo"},
+		{"file_ids": ids, "label": "set"},
+	} {
+		resp := e.do(http.MethodPost, "/v1/shares", mustJSON(t, body),
+			withHeader("Content-Type", "application/json"))
+		if resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create share = %d: %s", resp.StatusCode, readBody(t, resp))
+		}
+		var got created
+		decode(t, resp, &got)
+		made[body["label"].(string)] = got
+	}
+
+	var list struct {
+		Shares []struct {
+			ID        string   `json:"id"`
+			Label     string   `json:"label"`
+			FileCount int      `json:"file_count"`
+			IndexURL  string   `json:"index_url"`
+			FileIDs   []string `json:"file_ids"`
+		} `json:"shares"`
+		Count int `json:"count"`
+	}
+	decode(t, e.do(http.MethodGet, "/v1/shares", nil), &list)
+	if list.Count != 2 {
+		t.Fatalf("listed %d shares, want 2", list.Count)
+	}
+
+	want := map[string]int{"solo": 1, "set": 3}
+	for _, sh := range list.Shares {
+		expect, ok := want[sh.Label]
+		if !ok {
+			t.Errorf("unexpected share %q", sh.Label)
+			continue
+		}
+		if sh.FileCount != expect {
+			t.Errorf("share %q reports file_count %d, want %d", sh.Label, sh.FileCount, expect)
+		}
+		// The listing deliberately does not carry the members, and the count
+		// must not depend on their being loaded.
+		if len(sh.FileIDs) != 0 {
+			t.Errorf("share %q embedded %d file ids in the listing", sh.Label, len(sh.FileIDs))
+		}
+		if !strings.HasSuffix(sh.IndexURL, "/s/"+sh.ID+"/") {
+			t.Errorf("share %q has an odd index_url %q", sh.Label, sh.IndexURL)
+		}
+		if got := made[sh.Label].Share.FileCount; got != expect {
+			t.Errorf("create said %d files for %q, the listing says %d", got, sh.Label, expect)
+		}
+	}
+
+	var single struct {
+		Share struct {
+			FileCount int      `json:"file_count"`
+			FileIDs   []string `json:"file_ids"`
+		} `json:"share"`
+	}
+	decode(t, e.do(http.MethodGet, "/v1/shares/"+made["set"].Share.ID, nil), &single)
+	if single.Share.FileCount != 3 || len(single.Share.FileIDs) != 3 {
+		t.Errorf("single read: file_count %d, %d file ids, want 3 and 3",
+			single.Share.FileCount, len(single.Share.FileIDs))
+	}
+}
+
 func TestCreatingAShareValidatesEveryFile(t *testing.T) {
 	e := newTestEnv(t, nil)
 	_, up := e.upload([]byte("real"), "real.txt")
