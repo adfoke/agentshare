@@ -351,12 +351,19 @@ func (s *Server) publicShareInfo(c *gin.Context) {
 
 	items := make([]gin.H, 0, len(files))
 	for _, f := range files {
+		// A recipient of a share link is exactly the party that needs to know
+		// what it is about to download, so the classification travels with the
+		// listing rather than only with the bytes.
+		kind := s.blobKind(f.Sha256)
 		items = append(items, gin.H{
 			"id":           f.ID,
 			"name":         f.Name,
 			"size":         f.Size,
 			"sha256":       f.Sha256,
 			"content_type": f.ContentType,
+			"kind":         kind.Kind,
+			"executable":   kind.Executable,
+			"scriptable":   kind.Scriptable,
 			"created_at":   timeStr(f.CreatedAt),
 			"url":          s.absURL(c, "/s/"+sh.ID+"/f/"+f.ID),
 		})
@@ -384,11 +391,15 @@ func (s *Server) publicShareInfo(c *gin.Context) {
 	// written against the old shape keeps working.
 	if len(files) == 1 {
 		f := files[0]
+		kind := s.blobKind(f.Sha256)
 		body["file"] = gin.H{
 			"name":         f.Name,
 			"size":         f.Size,
 			"sha256":       f.Sha256,
 			"content_type": f.ContentType,
+			"kind":         kind.Kind,
+			"executable":   kind.Executable,
+			"scriptable":   kind.Scriptable,
 			"created_at":   timeStr(f.CreatedAt),
 		}
 	}

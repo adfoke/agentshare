@@ -33,6 +33,10 @@ type indexFile struct {
 	Href     string
 	Modified string
 	Size     string
+	// Tag names what the file is when that is worth saying before someone
+	// downloads it: executable, script, html, svg, xml. Empty for everything
+	// inert, which is most of it.
+	Tag string
 }
 
 type indexPage struct {
@@ -48,6 +52,10 @@ type indexPage struct {
 	Hidden   int
 	HasJSON  bool
 	JSONHref string
+	// Dangerous counts members that an operating system would run if asked.
+	// A link is often handed to someone who did not do the uploading, so the
+	// page says so before the download rather than after it.
+	Dangerous int
 }
 
 // renderShareIndex writes the index page for a share.
@@ -71,11 +79,21 @@ func (s *Server) renderShareIndex(c *gin.Context, sh *store.Share, files []*stor
 	var total int64
 	for _, f := range files {
 		total += f.Size
+		kind := s.blobKind(f.Sha256)
+		tag := ""
+		switch {
+		case kind.Executable, kind.Scriptable:
+			tag = kind.Kind
+		}
+		if kind.Executable {
+			page.Dangerous++
+		}
 		page.Files = append(page.Files, indexFile{
 			Name:     f.Name,
 			Href:     base + "/f/" + f.ID,
 			Modified: time.Unix(f.CreatedAt, 0).UTC().Format("02-Jan-2006 15:04"),
 			Size:     humanSize(f.Size),
+			Tag:      tag,
 		})
 	}
 	page.Count = len(files)

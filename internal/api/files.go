@@ -507,10 +507,15 @@ func (s *Server) serveBlob(c *gin.Context, spec contentSpec) {
 	}
 
 	etag := `"` + spec.Sha256 + `"`
+	kind := s.blobKind(spec.Sha256)
 	h := c.Writer.Header()
 	h.Set("Content-Type", ct)
 	h.Set("ETag", etag)
 	h.Set("X-Checksum-Sha256", spec.Sha256)
+	// What the bytes are, told to whoever is about to run them.
+	if kind.Kind != "" {
+		h.Set("X-Content-Kind", kind.Kind)
+	}
 	h.Set("Cache-Control", "private, no-store")
 	h.Set("Accept-Ranges", "bytes")
 	if spec.FileID != "" {
@@ -520,9 +525,28 @@ func (s *Server) serveBlob(c *gin.Context, spec contentSpec) {
 		h.Set("X-File-Size", strconv.FormatInt(spec.Size, 10))
 	}
 	// Attachment by default: a file service should hand back a file, not render
-	// it. `?inline=1` (alias `?view=1`) asks for the other behaviour.
-	inline := truthy(c.Query("inline")) || truthy(c.Query("view"))
+	// it. `?inline=1` (alias `?view=1`) asks for the other behaviour and gets it
+	// only when rendering cannot turn the upload into something that runs — see
+	// contentKind.inlineReason. Both halves of that decision are computed from
+	// what the uploader sent, and neither the declared type nor the bytes are
+	// trusted on their own.
+	//
+	// A caller that asked for inline and did not get it is told why. Silently
+	// handing back an attachment is indistinguishable, from the outside, from a
+	// stored type the caller itself chose wrongly.
+	wantsInline := truthy(c.Query("inline")) || truthy(c.Query("view"))
+	refusal := kind.inlineReason(ct)
+	inline := wantsInline && refusal == ""
+	if wantsInline && !inline {
+		h.Set("X-Inline-Refused", refusal)
+	}
 	h.Set("Content-Disposition", contentDisposition(spec.Name, inline))
+	if !inline {
+		// A response that is not deliberately being rendered carries a sandbox.
+		// Inert for a download; the difference between a mistake and an
+		// execution if one is ever rendered by accident.
+		h.Set("Content-Security-Policy", sandboxCSP)
+	}
 
 	// ServeContent takes it from here: it evaluates If-None-Match against the
 	// ETag set above, plus If-Match, If-Modified-Since, If-Range and Range.

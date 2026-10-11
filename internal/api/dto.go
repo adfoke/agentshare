@@ -20,27 +20,42 @@ type fileURLs struct {
 }
 
 type fileDTO struct {
-	ID          string          `json:"id"`
-	Name        string          `json:"name"`
-	Size        int64           `json:"size"`
-	Sha256      string          `json:"sha256"`
-	ContentType string          `json:"content_type"`
-	Tags        []string        `json:"tags,omitempty"`
-	Meta        json.RawMessage `json:"meta,omitempty"`
-	Owner       string          `json:"owner,omitempty"`
-	CreatedAt   string          `json:"created_at"`
-	ExpiresAt   *string         `json:"expires_at"`
-	Downloads   int64           `json:"downloads"`
-	URLs        fileURLs        `json:"urls"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	Sha256      string `json:"sha256"`
+	ContentType string `json:"content_type"`
+	// Kind is what the bytes are, classified from their magic bytes; Executable
+	// and Scriptable spell out the two halves of that answer that matter to a
+	// caller about to run something. See kind.go.
+	Kind       string          `json:"kind,omitempty"`
+	Executable bool            `json:"executable"`
+	Scriptable bool            `json:"scriptable"`
+	Tags       []string        `json:"tags,omitempty"`
+	Meta       json.RawMessage `json:"meta,omitempty"`
+	Owner      string          `json:"owner,omitempty"`
+	CreatedAt  string          `json:"created_at"`
+	ExpiresAt  *string         `json:"expires_at"`
+	Downloads  int64           `json:"downloads"`
+	URLs       fileURLs        `json:"urls"`
 }
 
 func (s *Server) fileDTO(c *gin.Context, f *store.File) fileDTO {
+	// Classifying costs one read of the first 512 bytes of the blob, paid on
+	// every description — including each row of a listing. A listing is bounded
+	// at 1000 rows and the read lands in the page cache, so the price is a few
+	// milliseconds; in exchange, "which of these would run if I ran it" becomes
+	// a question the API answers without anyone downloading the bytes.
+	kind := s.blobKind(f.Sha256)
 	dto := fileDTO{
 		ID:          f.ID,
 		Name:        f.Name,
 		Size:        f.Size,
 		Sha256:      f.Sha256,
 		ContentType: f.ContentType,
+		Kind:        kind.Kind,
+		Executable:  kind.Executable,
+		Scriptable:  kind.Scriptable,
 		Tags:        f.Tags,
 		Owner:       f.Owner,
 		CreatedAt:   timeStr(f.CreatedAt),
