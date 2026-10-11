@@ -400,7 +400,7 @@
           "files"
         ],
         "summary": "Download the bytes",
-        "description": "Supports Range, ETag and If-None-Match. Attachment by default; add ?inline=1 to render instead.",
+        "description": "Supports Range, ETag and If-None-Match. Attachment by default. `?inline=1` (alias `?view=1`) asks for rendering, which is granted only for raster images, text/plain, audio and video whose bytes are not markup or a program; otherwise the response stays an attachment and names the reason in `X-Inline-Refused`. Every byte response carries `X-Content-Kind`.",
         "parameters": [
           {
             "name": "inline",
@@ -985,7 +985,7 @@
               "type": "boolean",
               "default": false
             },
-            "description": "Render rather than download, when the share covers a single file."
+            "description": "Render rather than download, when the share covers a single file and the type is safe to render. A refusal is reported in X-Inline-Refused."
           },
           {
             "name": "list",
@@ -1141,7 +1141,7 @@
           "shares"
         ],
         "summary": "One file inside a share",
-        "description": "Supports Range, ETag and If-None-Match. Attachment by default; add ?inline=1 to render instead. Spends one download credit when the share has a budget.",
+        "description": "Supports Range, ETag and If-None-Match. Attachment by default. `?inline=1` (alias `?view=1`) asks for rendering, which is granted only for raster images, text/plain, audio and video whose bytes are not markup or a program; otherwise the response stays an attachment and names the reason in `X-Inline-Refused`. Every byte response carries `X-Content-Kind`. Spends one download credit when the share has a budget.",
         "security": [],
         "parameters": [
           {
@@ -1345,7 +1345,34 @@
             "description": "Lowercase hex digest of the raw bytes."
           },
           "content_type": {
-            "type": "string"
+            "type": "string",
+            "description": "As declared by the uploader (or sniffed when nothing useful was declared). Not a guarantee — use `kind` for what the bytes actually are."
+          },
+          "kind": {
+            "type": "string",
+            "description": "What the bytes are, classified from their magic bytes. Nothing is executed or decoded to produce it.",
+            "enum": [
+              "executable",
+              "script",
+              "html",
+              "svg",
+              "xml",
+              "image",
+              "audio",
+              "video",
+              "archive",
+              "document",
+              "text",
+              "binary"
+            ]
+          },
+          "executable": {
+            "type": "boolean",
+            "description": "An operating system would run these bytes if asked. Check this before running anything you downloaded."
+          },
+          "scriptable": {
+            "type": "boolean",
+            "description": "A browser could run code out of this file if it were rendered."
           },
           "tags": {
             "type": "array",

@@ -96,7 +96,7 @@ curl -sS -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/jso
 |---|---|
 | `/s/<token>` | 单文件 → 字节；多文件 → 索引页。`?list=1` 强制索引页 |
 | `/s/<token>/` | **总是**索引页 |
-| `/s/<token>/f/<file_id>` | 取列表里的某个文件（`?inline=1` 可内联显示） |
+| `/s/<token>/f/<file_id>` | 取列表里的某个文件（`?inline=1` 可内联显示，仅限图片/纯文本/音视频） |
 | `/s/<token>/info` | JSON：成员清单、大小、摘要、剩余下载次数（不消耗次数） |
 
 **链接的形态在创建时就定死了**，不会因为成员过期或被删而改变 ——
@@ -109,8 +109,10 @@ curl -sS -X POST -H "Authorization: Bearer $T" -H 'Content-Type: application/jso
 - **零 JavaScript**，纯服务端生成，带 `CSP: default-src 'none'`。
 - **文件名一律转义** —— 文件名来自上传的人，`html/template` 保证 `<img onerror=…>`
   这种名字只会被显示、不会被执行。有回归测试盯着（注入 `text/template` 会立刻挂）。
-- **它链接的文件仍然是 `attachment`** —— 页面是我们生成的、可信，
-  但用户传上来的东西一律不内联渲染，所以传个 HTML 上来也不会在你的域名下跑脚本。
+- **页面本身零脚本**，文件名一律转义（`html/template`），并带 `CSP: default-src 'none'`。
+- **它链接的文件默认一律 `attachment`** —— 唯一的例外是 `?inline=1`，而它只对
+  **图片 / 纯文本 / 音视频**生效，见下面「上传的东西是别人的东西」。
+- 含可执行文件或脚本的成员会带一个小标签，页头也会写明有几个。
 - 过期的成员**从列表里隐去**并在页脚说明有几个被隐藏；**全部过期则整条链接回 410**。
 
 ## API 一览
@@ -152,6 +154,41 @@ X-Meta     / ?meta=      你自己的 JSON 对象，原样存下来
 X-Sha256                 断言内容摘要，不符就 400
 X-Content-Type           覆盖自动识别
 ```
+
+## 上传的东西是别人的东西
+
+这个服务**从不执行、解码、转换它存的东西** —— 上传的字节原样进 `blobs/`，原样出来。
+这是「别人传的程序不会变成跑起来的程序」的全部依据：全仓没有 `os/exec`、没有
+`unsafe`、没有任何格式的解析器（唯一的「读内容」是 `http.DetectContentType` 看头 512 字节，
+纯常量比较，见 `internal/api/kind.go`）；文件名只是元数据，从不参与拼路径；
+万一真出路径穿越，`ProtectSystem=strict` + `DynamicUser` + `MemoryDenyWriteExecute=yes`
+也让它落不到能执行的地方。
+
+但字节总会有下一个读者，所以**每份字节响应都带一个分类**，让人在运行之前就能判断：
+
+```
+X-Content-Kind: executable | script | html | svg | xml | image | audio
+                | video | archive | document | text | binary
+```
+
+同一个值也在每份文件描述里（`kind`），外加两个拆开的布尔：`executable`（操作系统会运行它）、
+`scriptable`（浏览器可能从里面跑出代码）。**它是从字节算的，不是信上传方声明的类型**；
+blob 不可变，所以这个结论稳定，不用入库。
+
+### 内联渲染的规则
+
+默认永远 `attachment`。`?inline=1`（别名 `?view=1`）要求渲染，两条都满足才给：
+
+1. 存储的 content-type 在**白名单**里：光栅图片、`text/plain`、音视频。
+   `text/html`、`image/svg+xml`、任何 `+xml`、`application/pdf` 都不在里面 ——
+   前三个是「能被当文档跑脚本」，PDF 是「浏览器里一个巨大的解析器」。
+2. 字节的 `kind` 不是 `executable` / `script` / `html` / `svg` / `xml`。
+
+被拒时不渲染，并在响应头里说明原因：`X-Inline-Refused: executable | scriptable | type`。
+另外凡是不渲染的响应一律带
+`Content-Security-Policy: sandbox; default-src 'none'; frame-ancestors 'none'`
+—— 对一次下载毫无影响，但哪天白名单被改错，它就是「一次失误」和「一次执行」的差别。
+（这条只加在不渲染的响应上：渲染的那些是图片和音视频，不需要为它们去推理 CSP。）
 
 ## 存储与一致性
 
@@ -254,9 +291,9 @@ ash get https://files.example.com/s/<token>
 ## 测试
 
 ```bash
-make test          # 48 个用例（api 26 / store 10 / config 7 / blob 5），不联网、不依赖 cgo
+make test          # 73 个用例（api 45 / store 13 / config 8 / blob 7），不联网、不依赖 cgo
 make vet
-make smoke         # 打一个已经在跑的实例，30 项端到端断言
+make smoke         # 打一个已经在跑的实例，41 项端到端断言
 bash deploy/install.sh   # （在服务器上）装完会顺带打一次 /healthz
 ```
 
@@ -282,6 +319,11 @@ bash deploy/install.sh   # （在服务器上）装完会顺带打一次 /health
 - **没有限速**。真放公网要限速的话，放在反代那一层比放在这里合适。
 - **没有多用户**。root + 受管 token 是刻意的：这是「一个人/一个团队的文件中转站」，
   不是网盘。所有人的文件在同一个命名空间里。
+- **不扫描内容**。没有杀毒、没有沙箱解包、没有内容审核。服务做的是「如实标注你下载的是什么」
+  （`kind` + sha256），不是「替你判断它安不安全」。
+  ⚠️ 推论：**永远不要把解析搬到这个进程里**。缩略图、转码、解压、上传即杀毒 ——
+  那是唯一真会把这套设计变成 RCE 的地方。真要做，独立进程 + 无网络 + 只读挂载，
+  或者干脆另开一台机器。
 
 ## 许可证
 
