@@ -1,4 +1,13 @@
-# Terminate TLS in front of agentshare.
+# Terminate TLS in front of agentshare — plain reverse proxy, no CDN.
+#
+# ⚠️ This is the *simplest* shape: a real certificate, nginx owns 443, no
+# Cloudflare in the path. If you are putting Cloudflare in front instead, don't
+# copy this one — use `nginx/` (which pairs with snippets/agentshare-proxy.conf,
+# cloudflare-guard.conf, acme-challenge.conf and a self-signed origin cert for
+# Cloudflare's Full mode). The two differ in ways that matter: here `:80`
+# redirects to https, and X-Forwarded-For is appended to; behind Cloudflare the
+# http visitor is proxied rather than redirected, and X-Forwarded-For is set
+# (not appended) because the realip module has already rewritten $remote_addr.
 #
 # server_name files.example.com;
 # Then start agentshare with:

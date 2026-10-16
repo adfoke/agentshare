@@ -6,7 +6,25 @@
 |---|---|
 | 内网 / 直连端口 / 前面已有反代 | `install.sh` + `agentshare.service` |
 | 公网域名，Cloudflare 橙云在前 | 上面 + `nginx/*`（代理地址） |
-| **还要传大文件**（超过橙云的上限） | 上面 + `nginx/dl.*.conf`（直连地址，见第三节） |
+| **还要传大文件**（超过橙云的上限） | 上面 + 一条**灰云直连地址**（见第三节；没有成品文件，那节给了骨架） |
+
+## 〇、参考实例
+
+下面几节是**通用配方**（`<域名>` / `<代理域名>` / `root@<主机>` 都是占位符，别照抄）。
+真正跑过的实例有三个，其中只有一个还在跑 —— **`nginx/share.tocli.cc.conf` 就是它那份**，
+也是本目录**唯一**留着的 vhost（另外两个已随各自的实例删掉，那两种形态改用第二节的骨架）：
+
+| 实例 | 主机 | 回源口 | 状态 |
+|---|---|---|---|
+| **`share.tocli.cc`** | LA（Vultr） | **8443** | **在跑**（CF 橙云）—— 即 `nginx/share.tocli.cc.conf` |
+| `tempsnap.cc` | LA 2（DMIT） | **443** | 2026-10-16 已下线并删除（域名解析也摘了）|
+| `dl.tempsnap.cc` | LA 2 | 443（灰云直连） | 随 `tempsnap.cc` 一并下线 |
+
+→ **新机器只需要先定一件事：源站的 443 空着没有。**
+  空着就直接听 443 —— 最省事，连 CF 的 Origin Rule 都不需要（本节末尾给了最小示例）；
+  被别的服务占着就挑一个别的端口（`share.tocli.cc` 用的是 8443），
+  再让 CF 的 Origin Rule 把 https 访客的回源口指过去 —— 见第二节「回源口」。
+→ 第三节的直连地址（`dl.*`）**现在没有在跑的实例**，那节的骨架是唯一的一份。
 
 ---
 
@@ -68,10 +86,46 @@ install -m 0644 nginx/hardening.conf          /etc/nginx/conf.d/00-agentshare-ha
 # 版本号：改这一条，不是加一条（加了会报 duplicate directive）
 sed -i 's/^\tserver_tokens build;.*/\tserver_tokens off;/' /etc/nginx/nginx.conf
 
-install -m 0644 nginx/tempsnap.cc.conf        /etc/nginx/sites-available/<你的域名>.conf   # 改成自己的 server_name
+# ⚠️ 必须在装 vhost 之前：cloudflare-guard.conf 用的 $agentshare_cf_peer 就定义在这里
+#    生成的 conf.d/cloudflare-geo.conf 里。反了的话 nginx -t 报未知变量、reload 被卡住，
+#    从那一刻起整台机器的配置都改不动（这是真踩过的坑，见第六节）
 bash nginx/update-cloudflare-ips.sh           # 生成 realip + geo 两个 conf.d 文件
+
+# 本目录留着的 vhost 只有这一份（443 被占着 → 听 8443）；443 空着的那种形态见下面的小例。
+install -m 0644 nginx/share.tocli.cc.conf     /etc/nginx/sites-available/<域名>.conf
 ln -sf /etc/nginx/sites-available/<域名>.conf /etc/nginx/sites-enabled/
 nginx -t && systemctl reload nginx
+```
+
+照抄后要改：`server_name`、证书路径、日志文件名、以及要不要 `default_server`
+（那份里连 8443 + Origin Rule 一起带着说明，443 空着时按下面这个骨架改）。
+
+**源站 443 空着**（最省事的一种，连 CF 的 Origin Rule 都不用配）：
+
+```nginx
+server {
+    listen      80;
+    listen      [::]:80;
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2       on;
+    server_name <你的域名>;
+
+    ssl_certificate     /etc/nginx/ssl/<你的域名>.crt;   # 自签即可：Full 模式不校验源站证书
+    ssl_certificate_key /etc/nginx/ssl/<你的域名>.key;
+
+    # 别用默认的 combined —— 它会把 /s/<token> 明文写进日志（见上面那段）
+    access_log /var/log/nginx/<域名>.access.log agentshare;
+    error_log  /var/log/nginx/<域名>.error.log;
+
+    include /etc/nginx/snippets/acme-challenge.conf;
+
+    location / {
+        include /etc/nginx/snippets/cloudflare-guard.conf;   # 见第三节：这个端口谁都能连
+        proxy_pass http://127.0.0.1:8080;
+        include /etc/nginx/snippets/agentshare-proxy.conf;
+    }
+}
 ```
 
 `hardening.conf` 做三件事：关掉版本号（改 nginx.conf 那一行）、给所有 vhost 发 HSTS、
@@ -104,6 +158,56 @@ nginx 在 reload 成功之前一直用内存里的旧配置服务，所以这个
 - **自签证书** —— zone 的 SSL 模式是 `Full`（不是 `Full (strict)`），
   CF 到源站这一跳不校验证书。**若改成 `Full (strict)`，必须换真证书，否则全站 526。**
 
+### 回源口：源站的 443 空着，还是被占着
+
+CF 的回源口**默认跟随访客的 scheme**（http 访客走 80、https 访客走 443），
+跟 zone 的 SSL 模式无关。所以先看一眼源站的 443：
+
+- **空着** → 什么都不用配。`tempsnap.cc` 就是这个形态：自签证书 + `listen 443 ssl`，
+  Full 模式下 CF 不校验它，一条 CF 规则都不需要。
+- **被别的服务占着** → nginx 只能听一个别的端口（`share.tocli.cc` 那台用的是 8443，
+  因为 443 是 xray REALITY 的），再用 **Origin Rule**（phase `http_request_origin`）
+  把 https 访客的回源口指过去。
+
+⚠️ **443 被占着却不配这条规则**：CF 照旧打 443 → 落到那个别的服务上 →
+REALITY 会把未认证握手**回落给它的 `dest`**（现在是 `www.amazon.com`，早先是
+`www.yahoo.co.jp`）→ **访客看到的是别人站点的 404 页**。
+判别指纹：`server: cloudflare` + CF 的 ray 头 + **body 根本不是你的站点**。
+（`dest` 是会变的 —— 拿不准就去读那台机器的 xray 配置，别背域名。）
+
+| 表达式 | 回源口 | |
+|---|---|---|
+| `(http.host eq "<域名>" and ssl)` | `8443` | **必需，只要这一条** |
+| `(http.host eq "<域名>" and not ssl)` | `80` | 冗余（默认就是 80）；带着 `and not ssl` 所以无害 |
+
+★ **为什么"只要一条"**：http 访客的回源口本来就是 80，多写一条属于重复；
+而**没带 `not ssl` 的「一律 → 80」是有害的** —— 它会把 **https 访客**也送回明文口，
+症状是 CF 的 `400 Invalid URL` 或打回 443 的那个服务，和"规则没生效"长得几乎一样
+（2026-10-11 在 tomoon 上现场证明过）。
+★ 同理**别写成"一律 → 8443"**：往回源口发明文请求会被拒
+（`The plain HTTP request was sent to HTTPS port`）。
+★ **CF 规则有传播窗口**：改完立刻测可能拿到旧边缘的答复（实测中间夹过一次 400，
+等 60 秒 → 10/10 全 200）。**首轮异常先原样复测再下结论。**
+
+**怎么改** —— 要 zone 级写权限（CF 面板点，或一个带 Zone → Origin Rules 写权限的 token）。
+`cf` CLI 的 beta 版子命令全改名了，直接打 API 更可控：
+
+```bash
+ZID=<zone id>
+# 1) 先备份 —— 这份 JSON 的 result.rules 就是待会儿 PUT 的 body
+curl -sS -H "Authorization: Bearer $CF_TOKEN" \
+  "https://api.cloudflare.com/client/v4/zones/$ZID/rulesets/phases/http_request_origin/entrypoint" \
+  > origin-rules-backup.json
+# 2) 在每条规则 expression 的主机名括号里补上你的域名（`or http.host eq "…"`），其余字段原样照抄
+# 3) PUT 同一个 URL，body = {"rules": [...]}
+```
+
+⚠️ **phase entrypoint 不支持 DELETE**（回 405）：清空要用 `PUT {"rules": []}`，
+而更新是**整体替换** —— 所以第 1 步的备份不是客套话。
+★ 回填时我只留了 `action` / `action_parameters` / `description` / `enabled` / `expression`
+这五个字段（把 `id`/`ref`/`version`/`last_updated` 剥掉），一次就过 ——
+**至于原样带回去会不会被拒，没测过，别当结论。**
+
 ### Cloudflare 的 real_ip
 
 橙云在前时每个请求都从 CF 的地址到源站 —— 不处理的话 nginx 会给每个客户端都记一个 CF 的 IP，
@@ -133,7 +237,8 @@ Cloudflare 橙云会对**请求体**设上限（实测 100 MiB，见第四节）
 apt-get install -y certbot
 install -d -m 0755 /var/www/certbot
 install -m 0644 nginx/acme-challenge.conf /etc/nginx/snippets/acme-challenge.conf
-install -m 0644 nginx/dl.tempsnap.cc.conf /etc/nginx/sites-available/dl.<域名>.conf   # 改 server_name + 证书路径
+# vhost 照下面那份骨架写成 /etc/nginx/sites-available/dl.<域名>.conf
+# （成品文件已随其实例一起移除；443 被占着的机器得另挑端口，见第二节「回源口」）
 ln -sf /etc/nginx/sites-available/dl.<域名>.conf /etc/nginx/sites-enabled/
 certbot certonly --webroot -w /var/www/certbot -d dl.<域名> \
   --non-interactive --agree-tos --register-unsafely-without-email
@@ -144,19 +249,88 @@ chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 systemctl enable --now certbot.timer
 ```
 
-⚠️ **证书必须在 443 块之前拿到**：那份 vhost 引用了
+★ **这份 vhost 的实例（`dl.tempsnap.cc`）已经随 `tempsnap.cc` 一起下线，成品文件也移除了**
+—— 下面是最小的等价骨架（上面那三条"为什么"就是它的注释版）：
+
+```nginx
+# :80 只做两件事：伺候 ACME 挑战，其余全部 301 到 https ——
+# 直连没有 CDN 那一跳，token 走明文会被链路上的人读走。
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name dl.<域名>;
+    access_log /var/log/nginx/access.log agentshare;
+
+    include /etc/nginx/snippets/acme-challenge.conf;
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# :443 才是真正的直连口。**这里没有 cloudflare-guard，也不该有** ——
+# 灰云意味着访客本来就不是 CF，挂了就把真实访客全挡在门外。
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    server_name dl.<域名>;
+    access_log /var/log/nginx/access.log agentshare;
+
+    ssl_certificate     /etc/letsencrypt/live/dl.<域名>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dl.<域名>/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    # 刻意不做 default_server：裸 IP / 没配置过的名字都落回代理域名那个 vhost，
+    # 在那里被 guard 挡掉。要够到这个口，就得指名道姓。
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        include /etc/nginx/snippets/agentshare-proxy.conf;
+    }
+}
+```
+
+⚠️ **证书必须在 443 块之前拿到**：这份 vhost 引用了
 `/etc/letsencrypt/live/dl.<域名>/fullchain.pem`，文件不存在时 `nginx -t` 直接失败。
 先只装 80 块、签发、再补 443 块（或者让首次签发走默认 server 的 ACME location）。
 
 ### ⚠️ 为什么必须给代理地址加 guard
 
-直连地址一旦存在，**443 就得对全网开放**（客户端不再是 CF 了）。于是任何知道源站 IP 的人
-都能 `Host: <代理域名>` 直接打过来，**整条绕过 CDN** —— 它的 WAF、bot 规则、限速、
-以及直连地址存在的理由（请求体上限）全部失效。
+**只要端口不是"只有 CF 能连"，就得挂。** 触发它的情形有两种，而且经常同时出现：
 
-所以「只有 Cloudflare 能访问代理域名」这条防线从 **ufw 挪到了 nginx**：
-`cloudflare-guard.conf` 在代理域名的 :80 和 :443 两个 server 块里各 include 一次，
+- **有直连地址**（第三节）→ 那个端口必须对全网开放（客户端不再是 CF 了）；
+- **防火墙没按 CF 网段收口** → 端口本来就对全网开着（`tempsnap.cc` 那台的 80 就是这样，
+  `share.tocli.cc` 那台的 80 也是）。
+
+不管哪种，任何知道源站地址的人都能 `Host: <代理域名>` 直接打过来，
+**整条绕过 CDN** —— 它的 WAF、bot 规则、限速、以及直连地址存在的理由（请求体上限）全部失效。
+
+所以「只有 Cloudflare 能访问代理域名」这条防线落在 **nginx** 上：
+`cloudflare-guard.conf` include 进**每个** `location /`（或 :443 的 server 级），
 对端不在 CF 网段就 `return 403`。
+⚠️ **它对"这个端口"生效，不是对"这个域名"** —— 所以有几个 server 块/端口就要挂几次，
+少挂一处就是少一处（下面那条 `tempsnap.cc` 的 :80 就是漏出来的）。
+
+⚠️ **两处的位置不一样，这不是笔误**：
+
+| 端口 | 位置 | 为什么 |
+|---|---|---|
+| :443 | server 块顶层（`location` 之前） | 那一块没有哪个路径需要"先放行再判断"，非 CF 的请求哪个 path 都不该到 |
+| :80 | **`location /` 里面** | 上面紧挨着 ACME 的 `location ^~`。server 级的 `if` 跑在 **server-rewrite 阶段、早于 location 匹配**，会把挑战一起 403 掉 —— 而 http-01 挑战只走 :80、且来自 Let's Encrypt 而不是 CF，挡了就等于断掉续期。放进 `location /` 后检查发生在 location 选定之后，`^~` 那个 location 仍然优先命中 |
+
+（实测过：把同样的检查放在 :443 的 **server 级**，从非 CF 地址直连
+`/.well-known/acme-challenge/` 拿到的是 **403** —— 那个 location 其实够不着。）
+
+★ **两个端口写在同一个 server 块里时**（`share.tocli.cc` 就是：一块听 80 + 8443），
+`location /` 是唯一的位置，"服务器级"这个选项直接不存在 —— 而 ACME 的 `location ^~`
+照样优先命中（实测：非 CF 对端打 `/.well-known/acme-challenge/<探针>` 得到 **404** 而不是 403，
+说明它没被 guard 吃掉；同一个对端打 `/healthz` 是 403）。
+
+★ **别漏掉任何一条进来的路。** `tempsnap.cc` 那台最早只挂了 :443 —— 因为它的 :80 那个块是
+:80 的 `default_server`，`http://<源站IP>/`（连 Host 头都不用）就直接被转发给 agentshare，
+绕开了 CF 的 WAF / bot 规则 / 限速。（`:443` 那次靠 `default_server` 落到 guard 上挡住了，
+`:80` 没有 —— 而 `deploy/README` 里本来就写着"两个 server 块各 include 一次"，是配置漏了。）
+`share.tocli.cc` 那台没有这个问题：它不是 `default_server`，
+裸 IP / 别的 Host 会落回 clash-sub 的 404。
 
 **关键细节：判的是 `$realip_remote_addr`，不是 `$remote_addr`。**
 realip 模块跑在 post-read 阶段，早于 access 阶段 —— 等 `allow`/`deny` 之类求值时，
@@ -239,7 +413,7 @@ grep AGENTSHARE_ADMIN_TOKEN /etc/agentshare.env
 # 升级
 HOST=root@host ./deploy/deploy.sh
 
-# 端到端自检（30 项断言，会自己清理干净）
+# 端到端自检（41 项断言，跑完自己清理干净）
 AGENTSHARE_ADMIN_TOKEN=$(grep -oP '(?<=^AGENTSHARE_ADMIN_TOKEN=).*' /etc/agentshare.env) \
   bash scripts/smoke.sh https://<域名>
 
@@ -264,3 +438,142 @@ EXPECT_BASE=https://<代理域名> bash scripts/smoke.sh https://dl.<域名>
 - **打包加 `COPYFILE_DISABLE=1`** 可少传 macOS 的 `._*` 同伴文件。
 - **公网仓库里别写源站 IP**（这份文档用 `<域名>` / `<代理域名>` 占位就是这个原因）——
   否则等于把 CDN 隐藏源站的效果从仓库里抵消掉。
+
+---
+
+## 六、`share.tocli.cc`（LA）这台的具体情况
+
+同一个程序套进一台**已经跑着别的服务**的机器，所以下面四处选择值得单独记一笔
+（它们和 vhost 里的注释是一件事）：
+
+| 决定 | 为什么 |
+|---|---|
+| 听 **80 + 8443**，不听 443 | 443 被同机的 xray REALITY 占着 —— 只能让位，再靠 CF 的 Origin Rule 把 https 访客指过来（见第二节「回源口」） |
+| **共用** `/etc/nginx/ssl/tocli.cc-selfsigned.{crt,key}` | 那台本来就有 hyper / clash / mdview / tomoon 四个站共用一张自签证书；加个 SAN 名字比再签一张省事，Full 模式不校验、自签够用 |
+| 不做 `default_server` | 那台的 default_server 是 clash-sub（它原来就是）→ 裸 IP / 别的 Host 仍旧落回它的 404，这个 vhost 只应答自己的域名 |
+| guard 放在 **`location /` 里**（两个端口都放） | 一个 server 块同时听 80 和 8443，而 ACME 的 `location ^~` 要在两个端口上都够得着 —— 原因见第三节「为什么必须给代理地址加 guard」 |
+
+另外两点：这个 vhost 的日志用 `agentshare` 格式（`/s/<token>` 会写成 `/s/<redacted>`，
+理由见第二节）；它**不需要** `dl.*` 那种直连地址（大文件上限直接设成 100 MiB，
+跟橙云的真实上限对齐，见第四节）。
+
+**装法：顺序有讲究**（2026-10-16 实测跑通的就是这个顺序）。
+
+```bash
+scp -r nginx/{agentshare-proxy,acme-challenge,cloudflare-guard,hardening}.conf \
+       nginx/share.tocli.cc.conf nginx/update-cloudflare-ips.sh root@<LA>:/tmp/ash-nginx/
+
+ssh root@<LA> 'set -e
+  install -d -m 0755 /etc/nginx/snippets /var/www/certbot
+  install -m 0644 /tmp/ash-nginx/agentshare-proxy.conf /etc/nginx/snippets/
+  install -m 0644 /tmp/ash-nginx/acme-challenge.conf   /etc/nginx/snippets/
+  install -m 0644 /tmp/ash-nginx/cloudflare-guard.conf /etc/nginx/snippets/
+  install -m 0644 /tmp/ash-nginx/hardening.conf        /etc/nginx/conf.d/00-agentshare-hardening.conf
+  bash /tmp/ash-nginx/update-cloudflare-ips.sh
+  install -m 0644 /tmp/ash-nginx/share.tocli.cc.conf   /etc/nginx/sites-available/share
+  ln -sf /etc/nginx/sites-available/share /etc/nginx/sites-enabled/share
+  nginx -t && systemctl reload nginx'
+```
+
+1. 先装 snippet + `hardening.conf`：**此刻没有任何 vhost 引用它们**，坏也坏不到线上。
+2. 再跑 `update-cloudflare-ips.sh`：它生成 `cloudflare-{realip,geo}.conf`，
+   **guard 依赖的 `$agentshare_cf_peer` 就在 geo 里**。少了它 `nginx -t` 直接报未知变量，
+   reload 被卡住 → **整台机器的配置从此改不动**（这正是「先放坏文件再测」的坑）。
+3. 然后装 vhost + 软链。
+4. **最后换证书** —— 共用证书一换就影响那四个站，所以放最后，且 `nginx -t` 过了才 reload。
+   生成命令（EC P-256、十年、SAN 六个名字，别的参数照原样）：
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+  -subj "/CN=tocli.cc" \
+  -addext "subjectAltName=DNS:hyper.tocli.cc,DNS:clash.tocli.cc,DNS:mdview.tocli.cc,DNS:tomoon.space,DNS:www.tomoon.space,DNS:share.tocli.cc" \
+  -keyout /tmp/n.key -out /tmp/n.crt
+install -m 0644 /tmp/n.crt /etc/nginx/ssl/tocli.cc-selfsigned.crt
+install -m 0600 /tmp/n.key /etc/nginx/ssl/tocli.cc-selfsigned.key   # 私钥 600，别用 644
+```
+
+### CF 侧
+
+已配好（2026-10-16）：把 `share.tocli.cc` 加进 `tocli.cc` zone 原有的那两条 Origin Rule
+（`… and ssl` → 8443、`… and not ssl` → 80，即 ruleset version 6）。
+**配法和坑都在第二节「回源口」**，这里只留一条教训：
+
+⚠️ **"我手上没有这个能力"和"这件事做不了"是两回事。** 当天装机时本机确实没有任何
+CF 的 zone 级写通道（`cf` 已卸载、wrangler 的 OAuth 只有 `zone (read)`、拿它打
+`/zones/<id>/rulesets` 回 `Authentication error`），于是我把"没有写通道"当成结论，
+差点让 https 就这么搁着。实际上那只是**当时那组凭据的状态** ——
+装回 `cf` 并登录之后，十分钟就补上了。
+→ 写文档/写结论时把这两件事分开：**「当前这个工具链做不到」** ≠ **「这件事做不到」**。
+→ 真正的收获是当时**没有因此偷懒**：应用和 nginx 全部装好验好（41 项自检在源站侧全过），
+  规则一加立刻全绿。
+
+### ⚠️ 副作用：`hardening.conf` 里那条 HSTS 是**全机**的
+
+它写在 http 上下文，所以 LA 上**每个** vhost 都会带上
+`Strict-Transport-Security: max-age=15552000` —— 除非该 location 自己也有 `add_header`
+（`add_header` 的规矩是"子层有就完全不继承父层"）。实测那台五个站：
+
+| 站点 | 改前 | 改后 |
+|---|---|---|
+| hyper `/` | 无 | **无**（它自己的 security-headers 覆盖掉了） |
+| clash `/` | 无 | **有**（那个 location 只有 `return 404`，没有 add_header） |
+| clash `/s/` | 无 | **无**（订阅路径有自己的 add_header，不受影响） |
+| mdview `/`、tomoon `/` | 有 | 有 |
+| share `/` | — | 有（本意） |
+
+不想要这条就把它注释掉再装 —— 但那会让**仓库与线上差一行**，所以要么改仓库、要么留着。
+
+---
+
+## 七、下线一个实例（收尾清单）
+
+2026-10-16 把 `tempsnap.cc`（LA 2）那套整个删掉时走的就是这些步骤。
+域名换成自己的，**顺序别改：先备份，再从外往里拆，最后收防火墙。**
+
+```bash
+# 1) 先看数据 —— 决定要不要留备份（那次是 7 文件 / 4 分享 / 0 token / 1.6 MB，全是测试件，
+#    但仍然整包留了一份：数据 + env 里的 root token + nginx 件 + 单元 + 证书副本）
+D=/var/lib/private/agentshare          # DynamicUser 的真实目录，不是那个软链
+python3 -c "import sqlite3;print(sqlite3.connect('file:$D/agentshare.db?mode=ro',uri=True)\
+  .execute('select count(*) from files').fetchone())"
+du -sh "$D"
+
+# 2) 停服务 → 删单元 + 二进制 + 凭据文件
+systemctl disable --now agentshare.service
+rm -f /etc/systemd/system/agentshare.service /usr/local/bin/agentshare /etc/agentshare.env
+systemctl daemon-reload
+rm -f /var/lib/agentshare && rm -rf "$D"          # ⚠️ 两个都要删，见下面第 1 条
+
+# 3) 撤 nginx：vhost（enabled + available 两处）、snippet、conf.d、ACME webroot
+rm -f /etc/nginx/sites-enabled/<域名> /etc/nginx/sites-available/<域名>
+rm -f /etc/nginx/snippets/{agentshare-proxy,acme-challenge,cloudflare-guard}.conf
+rm -f /etc/nginx/conf.d/{00-agentshare-hardening,cloudflare-realip,cloudflare-geo}.conf
+rm -rf /var/www/certbot
+nginx -t && systemctl reload nginx
+
+# 4) 证书用 certbot 自己删，不要手删目录
+certbot delete --cert-name <域名> --non-interactive
+
+# 5) 没有站点要服务了 → 停掉 nginx 本体（可选）；防火墙收回最小
+systemctl stop nginx && systemctl disable nginx
+ufw delete allow 80/tcp && ufw delete allow 443/tcp
+
+# 6) 复核三层
+find / -xdev -iname '*agentshare*'    # 期望 0 命中（排除自己的备份目录）
+grep -rl agentshare /etc              # 期望 0 —— 「配置里真的不残留引用」的硬判据
+ss -lntp                              # 期望只剩 22（+ 本地 53 stub）
+# 再从外部探一次：22 open，80 / 443 / 8080 全部 closed/filtered
+```
+
+★ **三条实测事实**（这轮现场发现的，都不是推理）：
+
+1. **`DynamicUser=` 的状态目录有**两个**：`/var/lib/agentshare`（软链）**和**
+   `/var/lib/private/agentshare`（真实数据）。**少删一个就是残留** ——
+   而且 `find` 会被那个软链误导，别只看它。
+2. **`nginx -t` 在 `sites-enabled` 全空（零个 server 块）时仍然 successful。**
+   所以"没有站点"时不必为了让它能启动而留一个 stock `default` 站 ——
+   直接 stop + disable 就干净，配置树也不会变成一颗地雷。
+3. **证书要交给 `certbot delete`，不要手删 `/etc/letsencrypt/live/<域名>`**：
+   前者会把 renewal 配置一起收走。手删的话，域名都没了，
+   但续期任务每天还会报一次失败 —— 顺手把两条路都清掉
+   （Debian/Ubuntu 上是 `certbot.timer` + `/etc/cron.d/certbot`）。

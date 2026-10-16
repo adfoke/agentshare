@@ -54,7 +54,7 @@ echo hi | curl -sS -T - -H "Authorization: Bearer $T" -H "X-Filename: hi.txt" $B
 curl -sS -H "Authorization: Bearer $T" "$B/v1/files?limit=10"
 ```
 
-跑一遍端到端自检（30 项，会自己清理干净）：
+跑一遍端到端自检（**41 项**，真 HTTP、真字节、跑完自己清理干净）：
 
 ```bash
 AGENTSHARE_ADMIN_TOKEN=$T ./scripts/smoke.sh $B
